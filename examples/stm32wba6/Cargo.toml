@@ -14,6 +14,8 @@ embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime
 embassy-net = { version = "0.9.1", features = ["defmt", "udp", "proto-ipv6", "medium-ieee802154", ], optional = true }
 trouble-example-apps = { version = "0.1.0", path = "../apps", features = ["defmt"] }
 trouble-host = { path = "../../host", features = ["default-packet-pool-mtu-255"] }
+# The BAP/ASCS protocol logic the sink example drives.
+trouble-audio = { path = "../../audio" }
 bt-hci = "0.10"
 embassy-futures = "0.1.1"
 
@@ -36,6 +38,8 @@ stm32wba65ri = [ "stm32wba65ri-core", "embassy-stm32-wpan/linklayer6-ble-basic" 
 # ISO / LE Audio: Full link layer (required for CIS/BIS) plus trouble-host ISO support.
 # Build with --no-default-features: the Basic and Full link layer images cannot be linked together.
 stm32wba65ri-iso = [ "stm32wba65ri-core", "embassy-stm32-wpan/linklayer6-ble-full", "trouble-host/iso" ]
+# LE Audio unicast sink: ISO plus the PACS and ASCS GATT services.
+stm32wba65ri-audio = [ "stm32wba65ri-iso", "trouble-host/le-audio" ]
 
 [[bin]]
 name = "ble_bas_peripheral"
@@ -44,10 +48,19 @@ name = "ble_bas_peripheral"
 name = "iso_bringup"
 required-features = ["stm32wba65ri-iso"]
 
-[patch.crates-io]
-embassy-stm32 = { git = "https://github.com/embassy-rs/embassy.git", rev = "3cd51e6d8eb6aff8b0d64d9e56a75a538bcfc65a" }
-embassy-stm32-wpan = { git = "https://github.com/embassy-rs/embassy.git", rev = "3cd51e6d8eb6aff8b0d64d9e56a75a538bcfc65a" }
-embassy-sync = { git = "https://github.com/embassy-rs/embassy.git", rev = "3cd51e6d8eb6aff8b0d64d9e56a75a538bcfc65a" }
-embassy-executor = { git = "https://github.com/embassy-rs/embassy.git", rev = "3cd51e6d8eb6aff8b0d64d9e56a75a538bcfc65a" }
-embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "3cd51e6d8eb6aff8b0d64d9e56a75a538bcfc65a" }
-embassy-net = { git = "https://github.com/embassy-rs/embassy.git", rev = "3cd51e6d8eb6aff8b0d64d9e56a75a538bcfc65a" }
+[[bin]]
+name = "ble_audio_sink"
+required-features = ["stm32wba65ri-audio"]
+
+[[bin]]
+name = "iso_tx_probe"
+required-features = ["stm32wba65ri-iso"]
+
+[[bin]]
+name = "iso_sink"
+required-features = ["stm32wba65ri-iso"]
+
+[[bin]]
+name = "iso_central"
+required-features = ["stm32wba65ri-iso"]
+
