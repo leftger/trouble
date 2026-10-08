@@ -89,6 +89,9 @@ legacy-pairing = ["security"]
 # Enable Isochronous endpoint support
 iso = []
 
+# Enable LE Audio (BAP) GATT services: PACS, and ASCS as it lands.
+le-audio = ["gatt"]
+
 # Enable ATT queued writes (long characteristic writes)
 att-queued-writes = ["gatt"]
 
