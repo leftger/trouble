@@ -12,13 +12,16 @@
 //! ```
 //!
 //! [`QosConfig`] is a *single direction* view of a QoS configuration: one SDU
-//! interval, one maximum SDU, and the shared framing, PHY, retransmission number,
+//! interval, one maximum SDU, and the framing, PHY, retransmission number,
 //! transport latency and presentation delay. It mirrors ST's `BAP_ASEQoSConf_t`,
-//! which is likewise per-ASE. The layout of the `Config QoS` *operation* payload,
-//! which can carry both directions at once, has not been established — generated
-//! summaries of the specification disagree on its length (13, 15 and 18 octets
-//! have all been offered), so it should be read off the specification or a
-//! reference implementation before this type is used to parse one.
+//! which is likewise per-ASE, and it borrows ST's field order rather than any
+//! wire layout.
+//!
+//! It is **not** the `Config QoS` operation payload. That operation interleaves a
+//! 16-octet block per ASE — `ASE_ID | CIG_ID | CIS_ID | SDU_Interval(3) | Framing
+//! | PHY | Max_SDU(2) | RTN | Max_Transport_Latency(2) | Presentation_Delay(3)` —
+//! which Zephyr's `bt_ascs_qos` states directly. [crate::ascs::QosConfigBlock]
+//! models it; this type does not.
 //!
 //! The ASE Control Point framing that carries this payload (opcode,
 //! number-of-ASEs, ASE ID) is not modelled here; it belongs with the ASCS service

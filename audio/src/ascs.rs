@@ -26,23 +26,21 @@
 //!
 //! # Framing
 //!
-//! Most operations list their ASE IDs first and then a single parameter block
-//! shared by all of them, because the addressed ASEs form one CIS:
+//! Four operations carry a plain list of ASE IDs — `Receiver Start Ready`,
+//! `Disable`, `Receiver Stop Ready` and `Release`:
 //!
 //! ```text
-//! 0x02 | 0x02 | ASE_ID | ASE_ID | SDU_Interval_C_To_P | ... | Presentation_Delay_P_To_C
+//! Opcode | Number_of_ASEs | ASE_ID[n]
 //! ```
 //!
-//! `Config Codec` is different: it interleaves each ASE ID with that ASE's own
-//! codec configuration, so the operation can configure each ASE separately:
+//! The other four — `Config Codec`, `Config QoS`, `Enable` and `Update Metadata`
+//! — interleave each ASE ID with that ASE's own parameters, because those
+//! parameters can differ from one ASE to the next. See [`ControlPointRequest`]
+//! for the layouts.
 //!
-//! ```text
-//! 0x01 | 0x02 | ASE_ID | Codec_ID(5) | Len | Config | ASE_ID | Codec_ID(5) | Len | Config
-//! ```
-//!
-//! Treating the two the same would mis-read a `Codec_ID` octet as a second
+//! Treating the two the same would mis-read a parameter octet as a second
 //! `ASE_ID`, so the framing is opcode-aware: [`ControlPointRequest::ase_ids`]
-//! knows which layout to walk.
+//! knows which layout to walk. The layouts follow Zephyr's `ascs_internal.h`.
 //!
 //! # What is validated
 //!
@@ -53,9 +51,9 @@
 //!
 //! Still missing: which parameters a configuration is *required* to carry (a
 //! sampling frequency and a frame duration are mandatory, but an incomplete
-//! configuration is currently accepted), and any interpretation of a request's
-//! QoS and metadata parameters. For that reason [`apply`] always writes a zero
-//! `Reason`.
+//! configuration is currently accepted), and any judgement of the QoS and
+//! metadata parameters. Those are parsed into [`QosConfigBlock`] and
+//! [`MetadataBlock`] but not checked against anything.
 
 use crate::ase::{Ase, AseDirection, AseOperation, AseResponse};
 use crate::bap::{rate_from_index, PacRecord};
@@ -155,6 +153,30 @@ impl Reason {
 }
 
 /// A parsed ASE Control Point request.
+///
+/// The operations do not share one framing. Four of them — `Receiver Start
+/// Ready`, `Disable`, `Receiver Stop Ready` and `Release` — are a plain list of
+/// ASE IDs:
+///
+/// ```text
+/// Opcode | Number_of_ASEs | ASE_ID[n]
+/// ```
+///
+/// The other four interleave each ASE ID with that ASE's own parameters, because
+/// those parameters can differ from one ASE to the next:
+///
+/// ```text
+/// Config Codec    | Opcode | N | ASE_ID | Target_Latency | Target_PHY | Codec_ID(5) | Len | Config
+/// Config QoS      | Opcode | N | ASE_ID | CIG_ID | CIS_ID | SDU_Interval(3) | Framing | PHY
+///                              | Max_SDU(2) | RTN | Max_Transport_Latency(2) | Presentation_Delay(3)
+/// Enable          | Opcode | N | ASE_ID | Len | Metadata
+/// Update Metadata | Opcode | N | ASE_ID | Len | Metadata
+/// ```
+///
+/// Treating an interleaved operation as a plain list mis-reads a parameter octet
+/// as a second ASE ID, so the framing is walked per opcode. The layouts follow
+/// Zephyr's `ascs_internal.h`, which is a mature implementation of the same
+/// specification and states them as packed structs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPointRequest<'a> {
     op: AseOperation,
@@ -166,10 +188,9 @@ impl<'a> ControlPointRequest<'a> {
     /// Parse and validate a request written to the ASE Control Point.
     ///
     /// This checks the opcode, the ASE count and the framing of the operation
-    /// body, so the accessors below cannot fail. The *contents* of an operation —
-    /// the codec, QoS and metadata parameters — are validated separately, against
-    /// the server's advertised capabilities, because only the operation that
-    /// carries them can judge them.
+    /// body, so the accessors below cannot fail. The *contents* — the codec, QoS
+    /// and metadata parameters — are validated separately, because only the
+    /// operation that carries them can judge them.
     pub fn parse(data: &'a [u8]) -> Result<Self, AseResponse> {
         let (&raw_op, rest) = data.split_first().ok_or(AseResponse::InvalidLength)?;
         let op = AseOperation::from_u8(raw_op).ok_or(AseResponse::UnsupportedOpcode)?;
@@ -181,13 +202,28 @@ impl<'a> ControlPointRequest<'a> {
 
         let req = Self { op, count, body };
 
-        // Walk the framing now, so that every later access is total.
-        if op == AseOperation::ConfigCodec {
-            for block in req.config_codec_blocks() {
-                block?;
+        // Walk the body now, so that every later access is total.
+        match op {
+            AseOperation::ConfigCodec => {
+                for block in req.config_codec_blocks() {
+                    block?;
+                }
             }
-        } else if req.body.len() < req.count as usize {
-            return Err(AseResponse::InvalidLength);
+            AseOperation::ConfigQos => {
+                for block in req.config_qos_blocks() {
+                    block?;
+                }
+            }
+            AseOperation::Enable | AseOperation::UpdateMetadata => {
+                for block in req.metadata_blocks() {
+                    block?;
+                }
+            }
+            _ => {
+                if req.body.len() < req.count as usize {
+                    return Err(AseResponse::InvalidLength);
+                }
+            }
         }
 
         Ok(req)
@@ -205,19 +241,31 @@ impl<'a> ControlPointRequest<'a> {
 
     /// The ASE IDs the operation addresses, in the order given.
     ///
-    /// Every operation except `Config Codec` lists its ASE IDs first. `Config
-    /// Codec` interleaves each ASE ID with that ASE's own codec configuration,
-    /// so its IDs are taken from [`Self::config_codec_blocks`].
+    /// Walks whichever framing the opcode uses, so the IDs of an interleaved
+    /// operation come from its per-ASE blocks.
     pub fn ase_ids(&self) -> AseIdList {
         let mut ids = AseIdList::new();
 
-        if self.op == AseOperation::ConfigCodec {
-            for block in self.config_codec_blocks().flatten() {
-                ids.push(block.ase_id);
+        match self.op {
+            AseOperation::ConfigCodec => {
+                for block in self.config_codec_blocks().flatten() {
+                    ids.push(block.ase_id);
+                }
             }
-        } else {
-            for &id in &self.body[..self.count as usize] {
-                ids.push(id);
+            AseOperation::ConfigQos => {
+                for block in self.config_qos_blocks().flatten() {
+                    ids.push(block.ase_id);
+                }
+            }
+            AseOperation::Enable | AseOperation::UpdateMetadata => {
+                for block in self.metadata_blocks().flatten() {
+                    ids.push(block.ase_id);
+                }
+            }
+            _ => {
+                for &id in &self.body[..self.count as usize] {
+                    ids.push(id);
+                }
             }
         }
 
@@ -225,8 +273,6 @@ impl<'a> ControlPointRequest<'a> {
     }
 
     /// The per-ASE entries of a `Config Codec` operation.
-    ///
-    /// Yields one item per addressed ASE, and is empty for any other operation.
     pub fn config_codec_blocks(&self) -> CodecConfigBlocks<'a> {
         if self.op != AseOperation::ConfigCodec {
             return CodecConfigBlocks {
@@ -240,15 +286,54 @@ impl<'a> ControlPointRequest<'a> {
         }
     }
 
-    /// The operation parameters that follow the ASE ID list.
-    ///
-    /// Empty for `Config Codec`, whose parameters are per-ASE and reached through
-    /// [`Self::config_codec_blocks`].
-    pub fn params(&self) -> &'a [u8] {
-        if self.op == AseOperation::ConfigCodec {
-            return &[];
+    /// The per-ASE entries of a `Config QoS` operation.
+    pub fn config_qos_blocks(&self) -> QosConfigBlocks<'a> {
+        if self.op != AseOperation::ConfigQos {
+            return QosConfigBlocks {
+                rest: &[],
+                remaining: 0,
+            };
         }
-        &self.body[self.count as usize..]
+        QosConfigBlocks {
+            rest: self.body,
+            remaining: self.count as usize,
+        }
+    }
+
+    /// The per-ASE metadata of an `Enable` or `Update Metadata` operation.
+    pub fn metadata_blocks(&self) -> MetadataBlocks<'a> {
+        if !matches!(self.op, AseOperation::Enable | AseOperation::UpdateMetadata) {
+            return MetadataBlocks {
+                rest: &[],
+                remaining: 0,
+            };
+        }
+        MetadataBlocks {
+            rest: self.body,
+            remaining: self.count as usize,
+        }
+    }
+
+    /// The operation parameters that follow a plain ASE ID list.
+    ///
+    /// The four operations that use that framing carry none, so this is empty —
+    /// including for the interleaved operations, whose parameters are reached
+    /// through their block iterators instead.
+    pub fn params(&self) -> &'a [u8] {
+        match self.op {
+            AseOperation::ConfigCodec
+            | AseOperation::ConfigQos
+            | AseOperation::Enable
+            | AseOperation::UpdateMetadata => &[],
+            _ => {
+                let n = self.count as usize;
+                if self.body.len() < n {
+                    &[]
+                } else {
+                    &self.body[n..]
+                }
+            }
+        }
     }
 }
 
@@ -295,6 +380,10 @@ impl AseIdList {
 pub struct CodecConfigBlock<'a> {
     /// The ASE being configured.
     pub ase_id: u8,
+    /// The peer's target latency, in milliseconds.
+    pub target_latency_ms: u8,
+    /// The peer's target PHY.
+    pub target_phy: u8,
     /// The codec the peer asks for.
     pub codec_id: CodecId,
     /// The codec-specific configuration, as an LTV block.
@@ -317,32 +406,153 @@ impl<'a> Iterator for CodecConfigBlocks<'a> {
         }
         self.remaining -= 1;
 
-        // ASE_ID (1), Codec_ID (5), configuration length (1), configuration (L).
-        let Some((&ase_id, rest)) = self.rest.split_first() else {
-            return Some(Err(AseResponse::InvalidLength));
-        };
-        if rest.len() < CodecId::SIZE + 1 {
+        // ASE_ID (1), target latency (1), target PHY (1), Codec_ID (5),
+        // configuration length (1), configuration (L).
+        const HEADER: usize = 1 + 1 + 1 + CodecId::SIZE + 1;
+        if self.rest.len() < HEADER {
             return Some(Err(AseResponse::InvalidLength));
         }
+
+        let ase_id = self.rest[0];
+        let target_latency_ms = self.rest[1];
+        let target_phy = self.rest[2];
 
         let mut codec_bytes = [0u8; CodecId::SIZE];
-        codec_bytes.copy_from_slice(&rest[..CodecId::SIZE]);
+        codec_bytes.copy_from_slice(&self.rest[3..3 + CodecId::SIZE]);
         let codec_id = CodecId::decode(&codec_bytes);
 
-        let len = rest[CodecId::SIZE] as usize;
-        let after_len = &rest[CodecId::SIZE + 1..];
-        if after_len.len() < len {
+        let len = self.rest[3 + CodecId::SIZE] as usize;
+        let after = &self.rest[HEADER..];
+        if after.len() < len {
             return Some(Err(AseResponse::InvalidLength));
         }
 
-        let (config, tail) = after_len.split_at(len);
+        let (config, tail) = after.split_at(len);
         self.rest = tail;
 
         Some(Ok(CodecConfigBlock {
             ase_id,
+            target_latency_ms,
+            target_phy,
             codec_id,
             config,
         }))
+    }
+}
+
+/// One ASE's entry in a `Config QoS` operation.
+///
+/// `framing` and `phy` are the raw wire octets; decoding them belongs with the
+/// QoS validation, which is not written yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QosConfigBlock {
+    /// The ASE being configured.
+    pub ase_id: u8,
+    /// The CIG the peer asks to place the CIS in.
+    pub cig_id: u8,
+    /// The CIS the peer asks for.
+    pub cis_id: u8,
+    /// The SDU interval, in microseconds. 24-bit on the wire.
+    pub sdu_interval_us: u32,
+    /// The ISOAL framing mode.
+    pub framing: u8,
+    /// The PHY bitfield.
+    pub phy: u8,
+    /// The maximum SDU size, in octets.
+    pub max_sdu: u16,
+    /// The retransmission number.
+    pub rtn: u8,
+    /// The maximum transport latency, in milliseconds.
+    pub max_transport_latency_ms: u16,
+    /// The presentation delay, in microseconds. 24-bit on the wire.
+    pub presentation_delay_us: u32,
+}
+
+/// Iterator over the per-ASE entries of a `Config QoS` operation.
+#[derive(Debug, Clone, Copy)]
+pub struct QosConfigBlocks<'a> {
+    rest: &'a [u8],
+    remaining: usize,
+}
+
+impl Iterator for QosConfigBlocks<'_> {
+    type Item = Result<QosConfigBlock, AseResponse>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+
+        // ASE_ID (1), CIG_ID (1), CIS_ID (1), SDU interval (3), framing (1),
+        // PHY (1), max SDU (2), RTN (1), max transport latency (2),
+        // presentation delay (3).
+        const BLOCK: usize = 1 + 1 + 1 + 3 + 1 + 1 + 2 + 1 + 2 + 3;
+        if self.rest.len() < BLOCK {
+            return Some(Err(AseResponse::InvalidLength));
+        }
+
+        let b = &self.rest[..BLOCK];
+        let block = QosConfigBlock {
+            ase_id: b[0],
+            cig_id: b[1],
+            cis_id: b[2],
+            sdu_interval_us: u32::from_le_bytes([b[3], b[4], b[5], 0]),
+            framing: b[6],
+            phy: b[7],
+            max_sdu: u16::from_le_bytes([b[8], b[9]]),
+            rtn: b[10],
+            max_transport_latency_ms: u16::from_le_bytes([b[11], b[12]]),
+            presentation_delay_us: u32::from_le_bytes([b[13], b[14], b[15], 0]),
+        };
+
+        self.rest = &self.rest[BLOCK..];
+        Some(Ok(block))
+    }
+}
+
+/// One ASE's metadata, in an `Enable` or `Update Metadata` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataBlock<'a> {
+    /// The ASE the metadata applies to.
+    pub ase_id: u8,
+    /// The metadata, as an LTV block. May be empty.
+    pub metadata: &'a [u8],
+}
+
+/// Iterator over the per-ASE metadata of an `Enable` or `Update Metadata`
+/// operation.
+#[derive(Debug, Clone, Copy)]
+pub struct MetadataBlocks<'a> {
+    rest: &'a [u8],
+    remaining: usize,
+}
+
+impl<'a> Iterator for MetadataBlocks<'a> {
+    type Item = Result<MetadataBlock<'a>, AseResponse>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+
+        // ASE_ID (1), metadata length (1), metadata (L).
+        if self.rest.len() < 2 {
+            return Some(Err(AseResponse::InvalidLength));
+        }
+
+        let ase_id = self.rest[0];
+        let len = self.rest[1] as usize;
+        let after = &self.rest[2..];
+        if after.len() < len {
+            return Some(Err(AseResponse::InvalidLength));
+        }
+
+        let (metadata, tail) = after.split_at(len);
+        self.rest = tail;
+
+        Some(Ok(MetadataBlock { ase_id, metadata }))
     }
 }
 
@@ -695,6 +905,9 @@ mod tests {
     use crate::ase::AseDirection;
     use crate::types::CodecId;
 
+    extern crate std;
+    use std::vec::Vec;
+
     /// A sink PAC record advertising LC3.
     fn lc3_caps() -> [PacRecord<'static>; 1] {
         [PacRecord {
@@ -712,8 +925,50 @@ mod tests {
         }
     }
 
-    /// `Config Codec` for one ASE: LC3 with a 48 kHz sampling frequency.
-    const CONFIG_CODEC_LC3_48K: &[u8] = &[0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x08];
+    /// The LC3 codec id: coding format 0x06, no company or vendor code.
+    const LC3: [u8; 5] = [0x06, 0x00, 0x00, 0x00, 0x00];
+
+    /// A codec-specific configuration: 48 kHz.
+    const CC_48K: &[u8] = &[0x02, 0x01, 0x08];
+
+    /// Build a `Config Codec` request, one entry per `(ase_id, codec, config)`.
+    ///
+    /// Each entry is `ASE_ID | Target_Latency | Target_PHY | Codec_ID(5) | Len |
+    /// Config`, interleaved rather than listed.
+    fn config_codec(entries: &[(u8, [u8; 5], &[u8])]) -> Vec<u8> {
+        let mut v = std::vec![0x01, entries.len() as u8];
+        for (ase_id, codec, cc) in entries {
+            v.push(*ase_id);
+            v.push(0x01); // target latency, milliseconds
+            v.push(0x02); // target PHY: LE 2M
+            v.extend_from_slice(codec);
+            v.push(cc.len() as u8);
+            v.extend_from_slice(cc);
+        }
+        v
+    }
+
+    /// Build a `Config QoS` request, one entry per `(ase_id, cig_id, cis_id)`.
+    ///
+    /// Each entry is `ASE_ID | CIG_ID | CIS_ID | SDU_Interval(3) | Framing | PHY
+    /// | Max_SDU(2) | RTN | Max_Transport_Latency(2) | Presentation_Delay(3)`,
+    /// interleaved rather than shared.
+    fn config_qos(entries: &[(u8, u8, u8)]) -> Vec<u8> {
+        let mut v = std::vec![0x02, entries.len() as u8];
+        for (ase_id, cig, cis) in entries {
+            v.push(*ase_id);
+            v.push(*cig);
+            v.push(*cis);
+            v.extend_from_slice(&[0x10, 0x27, 0x00]); // SDU interval: 10 000 us
+            v.push(0x00); // unframed
+            v.push(0x02); // LE 2M
+            v.extend_from_slice(&40u16.to_le_bytes()); // max SDU
+            v.push(2); // RTN
+            v.extend_from_slice(&20u16.to_le_bytes()); // max transport latency, ms
+            v.extend_from_slice(&[0x40, 0x9C, 0x00]); // presentation delay: 40 000 us
+        }
+        v
+    }
 
     #[test]
     fn parses_a_single_ase_request() {
@@ -726,35 +981,49 @@ mod tests {
     }
 
     #[test]
-    fn parses_two_ases_and_keeps_params_opaque() {
-        // Config QoS lists the ASE IDs first, then one shared parameter block.
-        let data = [0x02, 0x02, 0x03, 0x04, 0xAA, 0xBB];
+    fn config_qos_interleaves_each_ase_with_its_parameters() {
+        let data = config_qos(&[(0x03, 0x00, 0x00), (0x04, 0x00, 0x01)]);
         let req = ControlPointRequest::parse(&data).unwrap();
         assert_eq!(req.op(), AseOperation::ConfigQos);
         assert_eq!(req.ase_ids().as_slice(), &[0x03, 0x04]);
-        assert_eq!(req.params(), &[0xAA, 0xBB]);
+        // The QoS parameters are per ASE, so there is no shared block.
+        assert!(req.params().is_empty());
+
+        let mut blocks = req.config_qos_blocks();
+        let first = blocks.next().unwrap().unwrap();
+        assert_eq!(first.ase_id, 0x03);
+        assert_eq!(first.cig_id, 0x00);
+        assert_eq!(first.cis_id, 0x00);
+        assert_eq!(first.sdu_interval_us, 10_000);
+        assert_eq!(first.framing, 0x00);
+        assert_eq!(first.phy, 0x02);
+        assert_eq!(first.max_sdu, 40);
+        assert_eq!(first.rtn, 2);
+        assert_eq!(first.max_transport_latency_ms, 20);
+        assert_eq!(first.presentation_delay_us, 40_000);
+
+        let second = blocks.next().unwrap().unwrap();
+        assert_eq!(second.ase_id, 0x04);
+        assert_eq!(second.cis_id, 0x01);
+        assert!(blocks.next().is_none());
     }
 
     #[test]
     fn config_codec_interleaves_each_ase_with_its_configuration() {
-        // Config Codec does not list the ASE IDs first: each ASE ID is followed
-        // by that ASE's own Codec_ID, length and configuration.
-        let data = [
-            0x01, 0x02, // Config Codec, 2 ASEs
-            0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x08, // ASE 0
-            0x01, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x08, // ASE 1
-        ];
+        let data = config_codec(&[(0x00, LC3, CC_48K), (0x01, LC3, CC_48K)]);
         let req = ControlPointRequest::parse(&data).unwrap();
         assert_eq!(req.op(), AseOperation::ConfigCodec);
         assert_eq!(req.ase_ids().as_slice(), &[0x00, 0x01]);
-        // Config Codec has no shared parameters.
+        // Config Codec has no shared parameters either.
         assert!(req.params().is_empty());
 
         let mut blocks = req.config_codec_blocks();
         let first = blocks.next().unwrap().unwrap();
         assert_eq!(first.ase_id, 0x00);
+        assert_eq!(first.target_latency_ms, 0x01);
+        assert_eq!(first.target_phy, 0x02);
         assert_eq!(first.codec_id, CodecId::LC3);
-        assert_eq!(first.config, &[0x02, 0x01, 0x08]);
+        assert_eq!(first.config, CC_48K);
 
         let second = blocks.next().unwrap().unwrap();
         assert_eq!(second.ase_id, 0x01);
@@ -787,21 +1056,23 @@ mod tests {
 
     #[test]
     fn rejects_a_truncated_config_codec_block() {
-        // No room for Codec_ID and the length octet.
+        // No room for even the fixed part of a block.
         assert_eq!(
             ControlPointRequest::parse(&[0x01, 0x01, 0x00]),
             Err(AseResponse::InvalidLength)
         );
-        // Claims a 4-octet configuration but supplies two.
-        assert_eq!(
-            ControlPointRequest::parse(&[0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x04, 0xAA, 0xBB]),
-            Err(AseResponse::InvalidLength)
-        );
+
+        // A block that claims four octets of configuration and supplies two.
+        let mut data = config_codec(&[(0x00, LC3, &[])]);
+        let len_at = data.len() - 1;
+        data[len_at] = 0x04;
+        data.extend_from_slice(&[0xAA, 0xBB]);
+        assert_eq!(ControlPointRequest::parse(&data), Err(AseResponse::InvalidLength));
+
         // Two ASEs announced, only one block present.
-        assert_eq!(
-            ControlPointRequest::parse(&[0x01, 0x02, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            Err(AseResponse::InvalidLength)
-        );
+        let mut data = config_codec(&[(0x00, LC3, &[])]);
+        data[1] = 0x02;
+        assert_eq!(ControlPointRequest::parse(&data), Err(AseResponse::InvalidLength));
     }
 
     #[test]
@@ -831,11 +1102,7 @@ mod tests {
         let records = lc3_caps();
         let mut ases = [Ase::new(0, AseDirection::Sink), Ase::new(1, AseDirection::Sink)];
 
-        let data = [
-            0x01, 0x02, // Config Codec, 2 ASEs
-            0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x08, // ASE 0
-            0x01, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x08, // ASE 1
-        ];
+        let data = config_codec(&[(0x00, LC3, CC_48K), (0x01, LC3, CC_48K)]);
         let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
 
@@ -853,7 +1120,8 @@ mod tests {
         ases[0].handle(AseOperation::ConfigCodec);
 
         // Config QoS on both: valid for ASE 0, invalid for ASE 1 (still Idle).
-        let req = ControlPointRequest::parse(&[0x02, 0x02, 0x00, 0x01]).unwrap();
+        let data = config_qos(&[(0x00, 0x00, 0x00), (0x01, 0x00, 0x01)]);
+        let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &CodecCapabilities::NONE, &req);
 
         // Both carry the failure, and neither ASE moved.
@@ -895,8 +1163,9 @@ mod tests {
         let records = lc3_caps();
         let mut ases = [Ase::new(0, AseDirection::Sink)];
 
-        // Same shape, but coding format 0x07 rather than LC3's 0x06.
-        let data = [0x01, 0x01, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x08];
+        // Coding format 0x07 rather than LC3's 0x06.
+        let not_lc3 = [0x07, 0x00, 0x00, 0x00, 0x00];
+        let data = config_codec(&[(0x00, not_lc3, CC_48K)]);
         let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
 
@@ -909,14 +1178,14 @@ mod tests {
         let records = lc3_caps();
         let mut ases = [Ase::new(0, AseDirection::Sink)];
 
-        // A three-octet configuration whose first LTV claims a length of five.
-        let data = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x05, 0x01, 0x08];
+        // A configuration whose first LTV entry claims a length of five.
+        let data = config_codec(&[(0x00, LC3, &[0x05, 0x01, 0x08])]);
         let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert_eq!(resp.entries()[0].code, AseResponse::InvalidCodecConfiguration);
 
         // An empty configuration is not usable for LC3 either.
-        let data = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let data = config_codec(&[(0x00, LC3, &[])]);
         let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert_eq!(resp.entries()[0].code, AseResponse::InvalidCodecConfiguration);
@@ -927,7 +1196,8 @@ mod tests {
     fn a_well_formed_configuration_passes() {
         let records = lc3_caps();
         let mut ases = [Ase::new(0, AseDirection::Sink)];
-        let req = ControlPointRequest::parse(CONFIG_CODEC_LC3_48K).unwrap();
+        let data = config_codec(&[(0x00, LC3, CC_48K)]);
+        let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert!(resp.entries()[0].code.is_success());
         assert_eq!(ases[0].state(), crate::AseState::CodecConfigured);
@@ -940,7 +1210,7 @@ mod tests {
         let records = lc3_caps();
         let mut ases = [Ase::new(0, AseDirection::Sink)];
         // Sampling_Frequency ordinal 0x03 is 16 kHz.
-        let data = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x03];
+        let data = config_codec(&[(0x00, LC3, &[0x02, 0x01, 0x03])]);
         let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
 
@@ -954,7 +1224,7 @@ mod tests {
         // is wrong whatever the server supports.
         let records = lc3_caps();
         let mut ases = [Ase::new(0, AseDirection::Sink)];
-        let data = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x02];
+        let data = config_codec(&[(0x00, LC3, &[0x02, 0x01, 0x02])]);
         let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
 
@@ -976,23 +1246,17 @@ mod tests {
         }];
         let mut ases = [Ase::new(0, AseDirection::Sink)];
 
-        // A ten-octet configuration: 48 kHz, 10 ms, 40 octets.
-        let inside = [
-            0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x0A, // Config Codec, ASE 0, len 10
-            0x02, 0x01, 0x08, // sampling frequency 48 kHz
-            0x02, 0x02, 0x02, // frame duration 10 ms
-            0x03, 0x04, 40, 0, // 40 octets per codec frame
-        ];
-        let req = ControlPointRequest::parse(&inside).unwrap();
+        // 48 kHz, 10 ms, 40 octets: inside the advertised range.
+        let inside = [0x02, 0x01, 0x08, 0x02, 0x02, 0x02, 0x03, 0x04, 40, 0];
+        let data = config_codec(&[(0x00, LC3, &inside)]);
+        let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert!(resp.entries()[0].code.is_success());
 
         // The same, but 200 octets, above the advertised maximum.
-        let outside = [
-            0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x02, 0x01, 0x08, 0x02, 0x02, 0x02, 0x03, 0x04, 200,
-            0,
-        ];
-        let req = ControlPointRequest::parse(&outside).unwrap();
+        let outside = [0x02, 0x01, 0x08, 0x02, 0x02, 0x02, 0x03, 0x04, 200, 0];
+        let data = config_codec(&[(0x00, LC3, &outside)]);
+        let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert_eq!(resp.entries()[0].code, AseResponse::UnsupportedCodecConfiguration);
     }
@@ -1037,17 +1301,17 @@ mod tests {
     fn a_response_carries_the_reason_for_an_invalid_configuration() {
         let records = lc3_caps();
         let mut ases = [Ase::new(0, AseDirection::Sink)];
-        // A three-octet configuration whose first LTV claims a length of five.
-        let data = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x05, 0x01, 0x08];
+
+        // A configuration whose first LTV entry claims a length of five.
+        let data = config_codec(&[(0x00, LC3, &[0x05, 0x01, 0x08])]);
         let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
-
         assert_eq!(resp.entries()[0].code, AseResponse::InvalidCodecConfiguration);
         assert_eq!(resp.entries()[0].reason, 0x02);
 
         // And an unsupported value carries no reason.
-        let unsupported = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x03];
-        let req = ControlPointRequest::parse(&unsupported).unwrap();
+        let data = config_codec(&[(0x00, LC3, &[0x02, 0x01, 0x03])]);
+        let req = ControlPointRequest::parse(&data).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert_eq!(resp.entries()[0].code, AseResponse::UnsupportedCodecConfiguration);
         assert_eq!(resp.entries()[0].reason, 0x00);
