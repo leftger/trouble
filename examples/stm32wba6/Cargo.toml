@@ -14,6 +14,8 @@ embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime
 embassy-net = { version = "0.9.1", features = ["defmt", "udp", "proto-ipv6", "medium-ieee802154", ], optional = true }
 trouble-example-apps = { version = "0.1.0", path = "../apps", features = ["defmt"] }
 trouble-host = { path = "../../host", features = ["default-packet-pool-mtu-255"] }
+bt-hci = "0.10"
+embassy-futures = "0.1.1"
 
 defmt = "1.0.1"
 defmt-rtt = "1.0.0"
@@ -27,10 +29,20 @@ static_cell = "2"
 
 [features]
 default = ["stm32wba65ri"]
-stm32wba65ri = [ "embassy-stm32-wpan/stm32wba65ri", "embassy-stm32-wpan/ble-stack-llo", "embassy-stm32-wpan/linklayer6-ble-basic" ]
+# Chip support plus the link-layer-only (`llo`) stack, so the BLE host runs in Rust.
+stm32wba65ri-core = [ "embassy-stm32-wpan/stm32wba65ri", "embassy-stm32-wpan/ble-stack-llo" ]
+# Default build: Basic link layer, which does not support isochronous channels.
+stm32wba65ri = [ "stm32wba65ri-core", "embassy-stm32-wpan/linklayer6-ble-basic" ]
+# ISO / LE Audio: Full link layer (required for CIS/BIS) plus trouble-host ISO support.
+# Build with --no-default-features: the Basic and Full link layer images cannot be linked together.
+stm32wba65ri-iso = [ "stm32wba65ri-core", "embassy-stm32-wpan/linklayer6-ble-full", "trouble-host/iso" ]
 
-[[bin]] 
+[[bin]]
 name = "ble_bas_peripheral"
+
+[[bin]]
+name = "iso_bringup"
+required-features = ["stm32wba65ri-iso"]
 
 [patch.crates-io]
 embassy-stm32 = { git = "https://github.com/embassy-rs/embassy.git", rev = "3cd51e6d8eb6aff8b0d64d9e56a75a538bcfc65a" }

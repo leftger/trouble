@@ -1472,11 +1472,13 @@ dependencies = [
 name = "trouble-stm32wba-examples"
 version = "0.1.0"
 dependencies = [
+ "bt-hci",
  "cortex-m 0.7.9",
  "cortex-m-rt",
  "defmt 1.1.1",
  "defmt-rtt",
  "embassy-executor",
+ "embassy-futures 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "embassy-net",
  "embassy-stm32",
  "embassy-stm32-wpan",

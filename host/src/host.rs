@@ -13,7 +13,7 @@ use bt_hci::cmd::controller_baseband::{
     SetEventMaskPage2,
 };
 use bt_hci::cmd::info::ReadBdAddr;
-#[cfg(feature = "subrating")]
+#[cfg(any(feature = "subrating", feature = "iso"))]
 use bt_hci::cmd::le::LeSetHostFeature;
 #[cfg(feature = "shorter-connection-intervals")]
 use bt_hci::cmd::le::LeSetHostFeatureV2;

@@ -30,6 +30,8 @@ cargo batch \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,central,scan,controller-host-flow-control,connection-metrics,channel-metrics \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,central,scan,controller-host-flow-control,connection-metrics,channel-metrics,l2cap-sdu-reassembly-optimization \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,central,scan,controller-host-flow-control,connection-metrics,channel-metrics,l2cap-sdu-reassembly-optimization,connection-params-update \
+    --- build --release --manifest-path host/Cargo.toml --no-default-features --features peripheral,iso \
+    --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,central,iso \
     --- build --release --manifest-path examples/serial-hci/Cargo.toml \
     --- build --release --manifest-path examples/linux/Cargo.toml \
     --- build --release --manifest-path examples/linux/Cargo.toml --features security \
