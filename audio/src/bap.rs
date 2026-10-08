@@ -58,7 +58,7 @@ impl core::fmt::Display for BapError {
 
 /// BAP encodes the *configured* sampling frequency as an ordinal
 /// (`0x01` = 8 kHz), unlike the *capability* bitfield. This converts an ordinal.
-const fn rate_from_index(index: u8) -> Option<SampleRate> {
+pub(crate) const fn rate_from_index(index: u8) -> Option<SampleRate> {
     match index {
         0x01 => Some(SampleRate::Hz8000),
         0x03 => Some(SampleRate::Hz16000),
