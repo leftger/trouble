@@ -1,5 +1,6 @@
 **/target
 **/target_ci
+audio/Cargo.lock
 host/Cargo.lock
 host-macros/Cargo.lock
 bt-hci-linux/Cargo.lock
