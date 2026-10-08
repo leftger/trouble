@@ -24,8 +24,9 @@
 //! The next step is to extend this with `LE Set CIG Parameters`, which allocates a
 //! CIG/CIS in the controller and needs no peer device.
 
-use bt_hci::cmd::le::{LeReadBufferSizeV2, LeReadLocalSupportedFeatures};
+use bt_hci::cmd::le::{LeReadBufferSizeV2, LeReadLocalSupportedFeatures, LeRemoveCig};
 use bt_hci::controller::ControllerCmdSync;
+use bt_hci::param::CigId;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
@@ -94,7 +95,10 @@ async fn main(spawner: Spawner) {
 
 async fn probe<C>(controller: C)
 where
-    C: Controller + ControllerCmdSync<LeReadLocalSupportedFeatures> + ControllerCmdSync<LeReadBufferSizeV2>,
+    C: Controller
+        + ControllerCmdSync<LeReadLocalSupportedFeatures>
+        + ControllerCmdSync<LeReadBufferSizeV2>
+        + ControllerCmdSync<LeRemoveCig>,
 {
     let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
 
@@ -142,6 +146,23 @@ where
             Err(e) => {
                 let e = Debug2Format(&e);
                 error!("LE Read Buffer Size v2 failed: {:?}", e);
+            }
+        }
+
+        // 3. Is the ISO command surface implemented at all?
+        //
+        // `LE Remove CIG` for a CIG that was never allocated is a cheap probe: a
+        // controller implementing the ISO command set answers "Unknown Connection
+        // Identifier" (0x02), while one that does not know the opcode answers
+        // "Unknown HCI Command" (0x01).
+        match iso.command(LeRemoveCig::new(CigId::new(0))).await {
+            Ok(r) => {
+                let cig_id = r.cig_id.into_inner();
+                info!("LE Remove CIG(0): accepted, cig_id={}", cig_id);
+            }
+            Err(e) => {
+                let e = Debug2Format(&e);
+                info!("LE Remove CIG(0): rejected: {:?}", e);
             }
         }
 
