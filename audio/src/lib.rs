@@ -47,7 +47,8 @@ pub mod types;
 
 pub use ascs::{
     AscsError, AseIdList, CodecCapabilities, CodecConfigBlock, CodecConfigBlocks, ControlPointRequest,
-    ControlPointResponse, Reason, ResponseEntry, MAX_ASES_PER_OPERATION, RESPONSE_OPCODE,
+    ControlPointResponse, MetadataBlock, MetadataBlocks, QosConfigBlock, QosConfigBlocks, Reason, ResponseEntry,
+    MAX_ASES_PER_OPERATION, RESPONSE_OPCODE,
 };
 pub use ase::{Ase, AseDirection, AseOperation, AseResponse, AseState};
 pub use bap::{CodecSpecificConfig, PacRecord, QosConfig};
