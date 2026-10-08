@@ -156,6 +156,11 @@ impl AseOperation {
 }
 
 /// Result code returned for an ASE Control Point operation.
+///
+/// The codes are grouped by family. After the general codes comes
+/// codec-specific configuration (0x07-0x09), QoS configuration (0x0A-0x0C),
+/// `InsufficientResources`/`UnspecifiedError`, then metadata (0x0F-0x11) — each
+/// family having an unsupported, rejected and invalid variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[allow(missing_docs)]
@@ -167,14 +172,17 @@ pub enum AseResponse {
     InvalidAseState,
     InvalidAseDirection,
     UnsupportedAudioCapability,
-    UnsupportedConfigurationParameter,
-    RejectedConfigurationParameter,
-    InvalidConfigurationParameter,
+    UnsupportedCodecConfiguration,
+    RejectedCodecConfiguration,
+    InvalidCodecConfiguration,
+    UnsupportedQosConfiguration,
+    RejectedQosConfiguration,
+    InvalidQosConfiguration,
+    InsufficientResources,
+    UnspecifiedError,
     UnsupportedMetadata,
     RejectedMetadata,
     InvalidMetadata,
-    InsufficientResources,
-    UnspecifiedError,
 }
 
 impl AseResponse {
@@ -188,15 +196,43 @@ impl AseResponse {
             AseResponse::InvalidAseState => 0x04,
             AseResponse::InvalidAseDirection => 0x05,
             AseResponse::UnsupportedAudioCapability => 0x06,
-            AseResponse::UnsupportedConfigurationParameter => 0x07,
-            AseResponse::RejectedConfigurationParameter => 0x08,
-            AseResponse::InvalidConfigurationParameter => 0x09,
-            AseResponse::UnsupportedMetadata => 0x0A,
-            AseResponse::RejectedMetadata => 0x0B,
-            AseResponse::InvalidMetadata => 0x0C,
+            AseResponse::UnsupportedCodecConfiguration => 0x07,
+            AseResponse::RejectedCodecConfiguration => 0x08,
+            AseResponse::InvalidCodecConfiguration => 0x09,
+            AseResponse::UnsupportedQosConfiguration => 0x0A,
+            AseResponse::RejectedQosConfiguration => 0x0B,
+            AseResponse::InvalidQosConfiguration => 0x0C,
             AseResponse::InsufficientResources => 0x0D,
             AseResponse::UnspecifiedError => 0x0E,
+            AseResponse::UnsupportedMetadata => 0x0F,
+            AseResponse::RejectedMetadata => 0x10,
+            AseResponse::InvalidMetadata => 0x11,
         }
+    }
+
+    /// Parse a wire value.
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0x00 => AseResponse::Success,
+            0x01 => AseResponse::UnsupportedOpcode,
+            0x02 => AseResponse::InvalidLength,
+            0x03 => AseResponse::InvalidAseId,
+            0x04 => AseResponse::InvalidAseState,
+            0x05 => AseResponse::InvalidAseDirection,
+            0x06 => AseResponse::UnsupportedAudioCapability,
+            0x07 => AseResponse::UnsupportedCodecConfiguration,
+            0x08 => AseResponse::RejectedCodecConfiguration,
+            0x09 => AseResponse::InvalidCodecConfiguration,
+            0x0A => AseResponse::UnsupportedQosConfiguration,
+            0x0B => AseResponse::RejectedQosConfiguration,
+            0x0C => AseResponse::InvalidQosConfiguration,
+            0x0D => AseResponse::InsufficientResources,
+            0x0E => AseResponse::UnspecifiedError,
+            0x0F => AseResponse::UnsupportedMetadata,
+            0x10 => AseResponse::RejectedMetadata,
+            0x11 => AseResponse::InvalidMetadata,
+            _ => return None,
+        })
     }
 
     /// Whether the operation was accepted.
@@ -206,7 +242,7 @@ impl AseResponse {
 }
 
 /// One Audio Stream Endpoint.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Ase {
     id: u8,
     direction: AseDirection,
@@ -283,6 +319,15 @@ impl Ase {
         AseResponse::Success
     }
 
+    /// Whether [`Ase::handle`] would accept `op`, without changing the state.
+    ///
+    /// Used to check every ASE in a multi-ASE operation before applying it to
+    /// any of them.
+    pub fn can_handle(&self, op: AseOperation) -> AseResponse {
+        let mut probe = *self;
+        probe.handle(op)
+    }
+
     /// Finish a release, moving from [`AseState::Releasing`] to [`AseState::Idle`].
     pub fn complete_release(&mut self) -> AseResponse {
         if self.state == AseState::Releasing {
@@ -329,10 +374,40 @@ mod tests {
 
     #[test]
     fn response_codes_match_bap() {
+        // Every code from Success through Invalid Metadata must round-trip.
+        for v in 0x00..=0x11u8 {
+            let code = AseResponse::from_u8(v).unwrap();
+            assert_eq!(code.to_u8(), v);
+        }
+        assert_eq!(AseResponse::from_u8(0x12), None);
+
         assert_eq!(AseResponse::Success.to_u8(), 0x00);
         assert_eq!(AseResponse::InvalidAseState.to_u8(), 0x04);
         assert_eq!(AseResponse::InvalidAseDirection.to_u8(), 0x05);
+        // The three families sit in separate ranges, each unsupported/rejected/
+        // invalid in turn.
+        assert_eq!(AseResponse::UnsupportedCodecConfiguration.to_u8(), 0x07);
+        assert_eq!(AseResponse::RejectedCodecConfiguration.to_u8(), 0x08);
+        assert_eq!(AseResponse::InvalidCodecConfiguration.to_u8(), 0x09);
+        assert_eq!(AseResponse::UnsupportedQosConfiguration.to_u8(), 0x0A);
+        assert_eq!(AseResponse::RejectedQosConfiguration.to_u8(), 0x0B);
+        assert_eq!(AseResponse::InvalidQosConfiguration.to_u8(), 0x0C);
+        assert_eq!(AseResponse::InsufficientResources.to_u8(), 0x0D);
         assert_eq!(AseResponse::UnspecifiedError.to_u8(), 0x0E);
+        assert_eq!(AseResponse::UnsupportedMetadata.to_u8(), 0x0F);
+        assert_eq!(AseResponse::RejectedMetadata.to_u8(), 0x10);
+        assert_eq!(AseResponse::InvalidMetadata.to_u8(), 0x11);
+    }
+
+    #[test]
+    fn can_handle_does_not_mutate() {
+        let ase = Ase::new(0, AseDirection::Sink);
+        assert!(ase.can_handle(AseOperation::ConfigCodec).is_success());
+        assert_eq!(ase.state(), AseState::Idle);
+
+        // Not valid from Idle, and still no mutation.
+        assert_eq!(ase.can_handle(AseOperation::Enable), AseResponse::InvalidAseState);
+        assert_eq!(ase.state(), AseState::Idle);
     }
 
     #[test]
