@@ -64,6 +64,12 @@ cargo test --manifest-path ./host/Cargo.toml --no-run -- --nocapture
 cargo test --manifest-path ./examples/tests/Cargo.toml --no-run -- --nocapture
 cargo test --manifest-path ./tester/app/Cargo.toml --lib -- --nocapture
 
+cargo fmt --check --manifest-path ./audio/Cargo.toml
+cargo clippy --manifest-path ./audio/Cargo.toml --features codec-lc3
+cargo test --manifest-path ./audio/Cargo.toml --lib -- --nocapture
+cargo test --manifest-path ./audio/Cargo.toml --features codec-lc3 --lib -- --nocapture
+cargo build --release --manifest-path ./audio/Cargo.toml --features codec-lc3 --target thumbv8m.main-none-eabihf
+
 
 if [[ -z "${HIL_TOKEN}" ]]; then
     echo "No HIL token found, skipping running HIL tests"

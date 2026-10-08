@@ -1,0 +1,26 @@
+[package]
+name = "trouble-audio"
+version = "0.1.0"
+edition = "2021"
+description = "LE Audio (BLE Audio) host stack layered on top of trouble"
+license = "MIT OR Apache-2.0"
+keywords = ["no-std", "bluetooth", "le-audio", "lc3"]
+categories = ["embedded", "no-std"]
+readme = "../README.md"
+repository = "https://github.com/embassy-rs/trouble"
+publish = false
+
+[dependencies]
+# Pure-Rust LC3 codec, used when the `codec-lc3` feature is enabled.
+lc3-codec = { version = "0.2", default-features = false, optional = true }
+
+defmt = { version = "1.0.1", optional = true }
+
+[features]
+default = []
+
+# Enable the LC3 codec implementation.
+codec-lc3 = ["dep:lc3-codec"]
+
+# Implement `defmt::Format` for the public types.
+defmt = ["dep:defmt"]
