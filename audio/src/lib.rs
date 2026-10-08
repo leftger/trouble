@@ -43,6 +43,7 @@ pub mod ase;
 pub mod bap;
 pub mod codec;
 pub mod ltv;
+pub mod status;
 pub mod types;
 
 pub use ascs::{
@@ -54,4 +55,7 @@ pub use ase::{Ase, AseDirection, AseOperation, AseResponse, AseState};
 pub use bap::{CodecSpecificConfig, PacRecord, QosConfig};
 pub use codec::{AudioCodec, CodecConfig, CodecError, PassthroughCodec};
 pub use ltv::{Ltv, LtvIter, LtvWriter};
+pub use status::{
+    AseParams, AseStatusError, CodecConfiguredParams, MetadataParams, QosConfiguredParams, MAX_VALUE_LEN,
+};
 pub use types::{AudioContext, AudioLocation, CodecId, Framing, Packing, Phy, SampleRate};
