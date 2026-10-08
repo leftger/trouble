@@ -26,7 +26,9 @@
 //! [`uuid`] holds the assigned numbers, kept local rather than added to `bt-hci`
 //! because nothing outside this module needs them yet.
 
+pub mod ascs;
 pub mod pacs;
 pub mod uuid;
 
+pub use ascs::{AscsHandles, AscsStorage, AseDesc};
 pub use pacs::PacsConfig;
