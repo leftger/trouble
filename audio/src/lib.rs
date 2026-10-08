@@ -28,10 +28,12 @@
 //!
 //! Implemented: codec capabilities/configuration/metadata as LTV, the PAC record
 //! format, QoS configuration, the ASE state machine, the ASE Control Point
-//! framing and its multi-ASE orchestration, and the codec abstraction.
-//! Not yet implemented: per-opcode validation of the operation parameters, the
-//! PACS/ASCS GATT services, CIS setup, and ISO streaming glue — those land in a
-//! follow-up and the services will depend on `trouble-host`.
+//! framing with its multi-ASE orchestration, validation of a codec configuration
+//! against the advertised capabilities, and the codec abstraction.
+//! Not yet implemented: a comparison of a well-formed codec configuration against
+//! the advertised capability *values*, interpretation of the QoS and metadata
+//! parameters, the PACS/ASCS GATT services, CIS setup, and ISO streaming glue —
+//! those land in a follow-up and the services will depend on `trouble-host`.
 
 #![no_std]
 #![warn(missing_docs)]
@@ -44,7 +46,8 @@ pub mod ltv;
 pub mod types;
 
 pub use ascs::{
-    AscsError, ControlPointRequest, ControlPointResponse, ResponseEntry, MAX_ASES_PER_OPERATION, RESPONSE_OPCODE,
+    AscsError, AseIdList, CodecCapabilities, CodecConfigBlock, CodecConfigBlocks, ControlPointRequest,
+    ControlPointResponse, ResponseEntry, MAX_ASES_PER_OPERATION, RESPONSE_OPCODE,
 };
 pub use ase::{Ase, AseDirection, AseOperation, AseResponse, AseState};
 pub use bap::{CodecSpecificConfig, PacRecord, QosConfig};
