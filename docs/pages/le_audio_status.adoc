@@ -1,0 +1,232 @@
+= LE Audio (Isochronous Channels) Bring-up Status
+
+This page records the state of LE Audio support and two blockers found while bringing up isochronous
+channels on an STM32WBA65. It is a working status note for the `feat/le-audio` branch, not finished user
+documentation.
+
+== What exists today
+
+`trouble-host` already carries the portable parts of the ISO data path, and the `iso` feature builds
+(an earlier revision did not compile; that is fixed). On top of it, a `trouble-audio` crate provides the
+host-side LE Audio data model:
+
+* BAP wire types: sampling frequencies, frame durations, channel counts, audio locations, audio contexts,
+  `Codec_ID`, framing, packing, PHY.
+* Length-Type-Value encode/decode with the BAP capability/configuration/metadata type tables.
+* PAC records, codec-specific configuration, and the 13-octet Config QoS parameter block.
+* The Audio Stream Endpoint state machine, including the sink/source asymmetry around
+  _Receiver Start Ready_ / _Receiver Stop Ready_.
+* An `AudioDecoder`/`AudioEncoder` seam with a passthrough codec and an LC3 implementation built on the
+  pure-Rust `lc3-codec` crate.
+
+None of the above depends on a controller, so it is unit tested without hardware.
+
+== Blocker 1: `bt-hci` encodes `LE Set CIG Parameters` incorrectly
+
+In `bt-hci` 0.10.1, `LeSetCigParameters` sends command opcode `0x2062` but lays out its parameters using
+the layout of `LE Set CIG Parameters Test` (`0x2063`). The specification, and ST's own `ble_hci_le.h`,
+put the parameters in this order:
+
+[source,c]
+----
+CIG_ID, SDU_Interval_C_To_P, SDU_Interval_P_To_C, Worst_Case_SCA, Packing, Framing,
+Max_Transport_Latency_C_To_P, Max_Transport_Latency_P_To_C, CIS_Count, ...
+----
+
+whereas `bt-hci` emits:
+
+[source,c]
+----
+CIG_ID, SDU_Interval_C_To_P, SDU_Interval_P_To_C, FT_C_To_P, FT_P_To_C, ISO_Interval,
+Worst_Case_SCA, Packing, Framing, CIS_Count, ...
+----
+
+Both layouts happen to total 24 octets, so the parameter length is correct and the mismatch is invisible
+in the length field. A conforming controller reads offset 11 as `Packing`, finds `0x02`, and rejects the
+command with `Invalid HCI Command Parameters` (`0x12`). Dumping the bytes from `bt-hci`'s own writer
+shows the problem directly:
+
+[source]
+----
+62 20 18 00 10 27 00 10 27 00 02 02 08 00 00 00 00 01 00 28 00 28 00 02 02 02 02
+^opcode^ ^len^ ^CIG^ ^SDU C2P^  ^SDU P2C^  ^?^ ^?^ ^ISO^ ...
+----
+
+`bt-hci`'s `LeSetCigParametersTest` struct is ordered correctly; only the non-test command borrows the
+test layout. Reordering the struct fields corrects the encoding:
+
+[source]
+----
+62 20 18 00 10 27 00 10 27 00 00 00 00 14 00 14 00 01 00 28 00 28 00 02 02 02 02
+                                    ^SCA^ ^Packing^ ^Framing^ ^MTL C2P^ ^MTL P2C^ ^CIS count^
+----
+
+This affects every controller, not just ST, and blocks all CIS-based LE Audio until fixed.
+
+== Blocker 2: the STM32WBA link-layer-only stack reports a bogus status
+
+With the encoding corrected the ST controller still answers `0x12` — but it *does* allocate the CIG.
+Bracketing the command with `LE Remove CIG(0)` shows this:
+
+[source]
+----
+LE Remove CIG(0) BEFORE: rejected: Unknown Connection Identifier   <- CIG 0 not in use
+LE Set CIG Parameters failed: Invalid HCI Command Parameters
+LE Remove CIG(0) AFTER:  accepted, cig_id=0                        <- CIG 0 IS in use
+----
+
+Nothing else runs between the two checks, so the controller's status contradicts its own behaviour. A
+nine-variant sweep confirms it is not parameter validation — varying PHY (1M, 2M, both),
+`Max_Transport_Latency` (20/100 ms), `Worst_Case_SCA` (0/7), `RTN` (2/0), SDU interval (10/7.5 ms),
+`Max_SDU` (40/120) and stream direction (bidirectional vs sink-only) produced `0x12` **and an allocated
+CIG in every single case**.
+
+`LE Read Buffer Size v2` (opcode `0x2060`) behaves the same way on this part, and it takes no parameters
+at all — so this is a property of the stack's command translation, not of any argument.
+
+The consequence is specific and awkward: because the host never receives a successful response, it never
+learns the **CIS connection handles** carried in the `LE Set CIG Parameters` response, and cannot proceed
+to `LE Create CIS`.
+
+=== What is *not* the cause
+
+Investigated and ruled out:
+
+* **ISO not compiled in.** `link_layer/ll_cmd_lib/config/ble_full/ll_fw_config.h` gates it per chip as
+  `SUPPORT_CONNECTED_ISOCHRONOUS`, which evaluates to `1` for WBA6x. The controller advertises CIS
+  central/peripheral, isochronous broadcaster and synchronized receiver.
+* **Handlers missing from the image.** `stm32wba_ble_stack_llo.a` contains every ISO command handler.
+* **A missing enable step.** The CIS host-support feature bit is set via `LE Set Host Feature`
+  (OCF `0x74`) during host init and the command completes successfully.
+* **Missing event-state configuration.** `ll_intf_chng_evnt_hndlr_state`, which carries `allow_iso_data`,
+  is referenced by the LLO archive and defined by the link layer, so ST's own stack code reaches it.
+
+=== Why the LL is not the problem
+
+The link layer is fine and exposes a complete, strongly-defined interface. It exports 229 `ll_intf_*`
+entry points, including the whole isochronous set:
+
+[source,c]
+----
+ble_stat_t ll_intf_le_set_cig_params(ble_intf_set_cig_params_comman_cmd_st* cmd, uint8_t* conn_hndl);
+ble_stat_t ll_intf_le_create_cis(...);
+ble_stat_t ll_intf_setup_iso_data_path(uint16_t conn_hndl, ble_intf_setup_iso_data_path* params);
+ble_stat_t ll_intf_rmv_iso_data_path(uint16_t conn_hndl, uint8_t data_path_dirc);
+ble_stat_t ll_intf_accept_cis_req(...);   ble_stat_t ll_intf_reject_cis_req(...);
+ble_stat_t ll_intf_le_read_buffer_size_v2(..., uint16_t* iso_len, uint8_t* num_iso_pkts);
+ble_stat_t ll_intf_alloc_iso_pkt(...);    void ll_intf_free_iso_sdu(...);
+----
+
+Note that `ll_intf_le_set_cig_params` takes an out-parameter for the connection handle — precisely the
+value the HCI path fails to deliver. The link layer also exports the host callback registration
+(`ll_intf_rgstr_hst_cbk`) and the controller-to-host ISO data path
+(`hci_send_iso_data_from_cntrlr_to_host`), so a host can drive it directly.
+
+This means the gap is confined to the HCI translation layer (the link-layer-only stack) and the
+`bt-hci`/platform glue, not to the controller itself.
+
+=== The link layer really is doing the work
+
+The link-layer-only stack *weakly* defines some `ll_intf_*` entry points (`ll_intf_le_read_buffer_size_v2`,
+`ll_intf_setup_iso_data_path`, `ll_intf_le_set_cig_params`) as 4-byte stubs, while the link layer defines
+them strongly. That raised the possibility of the classic weak-symbol hazard, where a weak definition
+satisfies a reference and stops the linker pulling the real one out of the archive — which would have
+meant a stub answering these commands with a fixed error.
+
+A linker map refutes that. Comparing symbol sizes:
+
+[cols="3*",options="header"]
+|===
+| symbol | link layer | final image
+
+| `ll_intf_le_set_cig_params`
+| `T` 0xb4
+| 0xb4
+
+| `ll_intf_setup_iso_data_path`
+| `T` 0x34
+| 0x34
+
+| `ll_intf_le_read_buffer_size_v2`
+| `T` 0x10
+| 0x10
+|===
+
+The link layer's real implementations are the ones linked, so the controller is genuinely executing the
+command — which is consistent with the CIG being allocated.
+
+The HCI handlers, by contrast, exist *only* in the link-layer-only stack, and they are not stubs either:
+`hci_le_set_cig_parameters_process` is 202 bytes, `hci_le_read_buffer_size_v2_process` 86 bytes. So the
+link-layer-only stack translates the command, calls the link layer (which does the work), and then reports
+the wrong status. The fault is in that translation layer's status reporting.
+
+== Possible ways forward
+
+. **Drive the link layer directly through `ll_intf_*`.** This is the interface ST's own host stack uses, it
+   is linked and functional as shown above, and `ll_intf_le_set_cig_params` returns the connection handle
+   through an out-parameter — so CIG creation needs no event plumbing:
+
+[source,c]
+----
+typedef struct _ble_intf_set_cig_params_common_cmd_st {
+    ble_intf_cis_host_param_st*      cis_host_params;
+    ble_intf_cis_host_param_test_st* cis_host_params_test;
+    ble_intf_cig_host_param_st       cig_host_params;
+    uint8_t                          slv_cis_id;
+} ble_intf_set_cig_params_comman_cmd_st;
+
+ble_stat_t ll_intf_le_set_cig_params(ble_intf_set_cig_params_comman_cmd_st* ptr, uint8_t* conn_hndl);
+----
+
+   The cost is implementing the host-side bridge the link-layer-only stack currently provides — init,
+   command wrappers, and callback-based event and ISO data delivery — against an internal ABI of a binary
+   blob. Note the link-layer-only stack is linked today and initialises the same controller, so this should
+   be an either/or choice rather than two drivers side by side.
+. **Route only the misbehaving commands through direct calls**, keeping the link-layer-only stack for
+   everything else. Smaller, but it means two drivers over one controller and the boundary is subtle.
+. **Cross-check on a non-ST controller** that supports ISO, to confirm the host-side flow independently.
+
+Whichever route is taken, the `bt-hci` encoding bug must also be fixed, and the corrected encoding is
+required for any conforming controller.
+
+=== Verified: the direct call works
+
+Calling `ll_intf_le_set_cig_params` directly from Rust, with the struct layouts reconstructed from
+`ll_intf.h` and their sizes checked at compile time, succeeds on hardware:
+
+[source]
+----
+direct ll_intf_le_set_cig_params: ble_stat_t=0 conn_hndl=8
+HCI LE Remove CIG(1) after direct call: accepted
+----
+
+`ble_stat_t = 0` is success, and the CIS connection handle comes back — the value the HCI path never
+delivers. The follow-up `LE Remove CIG` over HCI then succeeds, confirming the CIG really was created and
+that the two paths can coexist for a single call. This also validates the reconstructed ABI: the
+link layer accepted the structs and reported success, so the field layout matches the blob.
+
+The same route also recovers the ISO data-buffer sizing, which HCI opcode `0x2060` refuses to provide:
+
+[source]
+----
+direct ll_intf_le_read_buffer_size_v2: ble_stat_t=0 acl_len=251 acl_num=8 iso_len=251 iso_num=14
+----
+
+So the controller accepts ISO data packets of up to 251 octets and buffers 14 of them, which comfortably
+covers a 40-octet SDU. These values are corroborated by the host's own startup log, which reports
+`setting txq to 8, fragmenting at 251` from the version 1 query — an independent check that the direct
+call returns real data rather than an uninitialised buffer.
+
+Two things to pin down next, both of which need a peer and so cannot be tested against a single board:
+
+* The out-parameter is a `uint8_t*`, while `ll_intf_le_create_cis` expects 16-bit `cis_conn_hndl` and
+  `acl_conn_hndl` pairs, so how the returned handle maps onto what `create_cis` wants is still open.
+* `ll_intf_le_create_cis` requires an established ACL connection, so CIS setup needs a second LE Audio
+  device from here on.
+
+== Related: ST's own audio stack is already available
+
+The `stm32-bindings` 0.2.2 package used by the examples ships `libble_audio.a` (ST's BLE Audio middleware)
+and `liblc3.a` (ST's LC3 codec) alongside the stack and link-layer libraries. These are not linked by
+default. They may be useful either as a reference or as an alternative to the pure-Rust LC3 backend in
+`trouble-audio`.
