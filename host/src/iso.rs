@@ -4,6 +4,7 @@ use bt_hci::cmd::{AsyncCmd, SyncCmd};
 use bt_hci::controller::{Controller, ControllerCmdAsync, ControllerCmdSync};
 use bt_hci::data::IsoPacket;
 use bt_hci::event::le::{LeCisEstablished, LeCisRequest};
+use bt_hci::param::ConnHandle;
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::channel::Channel;
 
@@ -75,17 +76,42 @@ impl<'stack, C: Controller, P: PacketPool> Iso<'stack, C, P> {
 /// sensible place to block there, so an application that lets them pile up loses
 /// information instead of stalling the link. Sizing them is the application's
 /// job.
-pub struct IsoEvents<M: RawMutex, const REQ: usize, const EST: usize> {
+pub struct IsoEvents<M: RawMutex, const REQ: usize, const EST: usize, const DATA: usize, const SDU: usize> {
     requests: Channel<M, LeCisRequest, REQ>,
     established: Channel<M, LeCisEstablished, EST>,
+    received: Channel<M, IsoSdu<SDU>, DATA>,
 }
 
-impl<M: RawMutex, const REQ: usize, const EST: usize> IsoEvents<M, REQ, EST> {
+/// One received ISO SDU, copied out of the controller's packet.
+///
+/// The copy is unavoidable: the packet borrows a buffer the controller owns and
+/// reuses as soon as the event handler returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsoSdu<const N: usize> {
+    /// The CIS the audio arrived on.
+    pub handle: ConnHandle,
+    /// How many octets of `data` are valid.
+    pub len: usize,
+    /// The payload.
+    pub data: [u8; N],
+}
+
+impl<const N: usize> IsoSdu<N> {
+    /// The payload, as a slice.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len.min(N)]
+    }
+}
+
+impl<M: RawMutex, const REQ: usize, const EST: usize, const DATA: usize, const SDU: usize>
+    IsoEvents<M, REQ, EST, DATA, SDU>
+{
     /// Create the queues.
     pub const fn new() -> Self {
         Self {
             requests: Channel::new(),
             established: Channel::new(),
+            received: Channel::new(),
         }
     }
 
@@ -99,21 +125,54 @@ impl<M: RawMutex, const REQ: usize, const EST: usize> IsoEvents<M, REQ, EST> {
     pub async fn established(&self) -> LeCisEstablished {
         self.established.receive().await
     }
+
+    /// Wait for audio.
+    pub async fn received(&self) -> IsoSdu<SDU> {
+        self.received.receive().await
+    }
+
+    /// Copy a received SDU into the queue.
+    ///
+    /// Drops it if it is too large to represent, rather than delivering a
+    /// truncated SDU as though it were a whole one, and drops it if the queue
+    /// is full.
+    fn push_received(&self, handle: ConnHandle, payload: &[u8]) {
+        if payload.len() > SDU {
+            return;
+        }
+
+        let mut data = [0u8; SDU];
+        data[..payload.len()].copy_from_slice(payload);
+
+        let _ = self.received.try_send(IsoSdu {
+            handle,
+            len: payload.len(),
+            data,
+        });
+    }
 }
 
-impl<M: RawMutex, const REQ: usize, const EST: usize> Default for IsoEvents<M, REQ, EST> {
+impl<M: RawMutex, const REQ: usize, const EST: usize, const DATA: usize, const SDU: usize> Default
+    for IsoEvents<M, REQ, EST, DATA, SDU>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<M: RawMutex, const REQ: usize, const EST: usize> EventHandler for IsoEvents<M, REQ, EST> {
+impl<M: RawMutex, const REQ: usize, const EST: usize, const DATA: usize, const SDU: usize> EventHandler
+    for IsoEvents<M, REQ, EST, DATA, SDU>
+{
     fn on_cis_request(&self, event: &LeCisRequest) {
         let _ = self.requests.try_send(event.clone());
     }
 
     fn on_cis_established(&self, event: &LeCisEstablished) {
         let _ = self.established.try_send(event.clone());
+    }
+
+    fn on_iso_data(&self, packet: &IsoPacket<'_>) {
+        self.push_received(packet.handle(), packet.data());
     }
 }
 
@@ -132,7 +191,7 @@ mod tests {
 
     #[test]
     fn a_cis_request_reaches_the_application() {
-        let events: IsoEvents<NoopRawMutex, 2, 2> = IsoEvents::new();
+        let events: IsoEvents<NoopRawMutex, 2, 2, 4, 120> = IsoEvents::new();
 
         let request = LeCisRequest::from_hci_bytes_complete(&cis_request_bytes(0x0040, 0x0002, 0x03, 0x01)).unwrap();
         events.on_cis_request(&request);
@@ -147,7 +206,7 @@ mod tests {
 
     #[test]
     fn a_full_queue_drops_rather_than_blocking() {
-        let events: IsoEvents<NoopRawMutex, 1, 1> = IsoEvents::new();
+        let events: IsoEvents<NoopRawMutex, 1, 1, 4, 120> = IsoEvents::new();
 
         for id in 0..5u8 {
             let request = LeCisRequest::from_hci_bytes_complete(&cis_request_bytes(1, 2, id, id)).unwrap();
@@ -158,5 +217,41 @@ mod tests {
         let queued = events.requests.try_receive().unwrap();
         assert_eq!(queued.cig_id, 0);
         assert!(events.requests.try_receive().is_err());
+    }
+
+    #[test]
+    fn a_received_sdu_is_copied_into_the_queue() {
+        let events: IsoEvents<NoopRawMutex, 2, 2, 4, 120> = IsoEvents::new();
+
+        let payload = [1u8, 2, 3, 4, 5];
+        events.push_received(ConnHandle(0x0040), &payload);
+
+        let sdu = events.received.try_receive().unwrap();
+        assert_eq!(sdu.handle.0, 0x0040);
+        assert_eq!(sdu.len, payload.len());
+        assert_eq!(sdu.as_slice(), &payload);
+    }
+
+    #[test]
+    fn an_oversized_sdu_is_dropped_rather_than_truncated() {
+        let events: IsoEvents<NoopRawMutex, 2, 2, 4, 4> = IsoEvents::new();
+
+        // One octet more than the queue can hold. Dropping it is honest; a
+        // truncated SDU would decode as audio that was never sent.
+        events.push_received(ConnHandle(1), &[0; 5]);
+
+        assert!(events.received.try_receive().is_err());
+    }
+
+    #[test]
+    fn the_data_queue_is_sized_independently_of_the_control_queues() {
+        let events: IsoEvents<NoopRawMutex, 2, 2, 1, 4> = IsoEvents::new();
+
+        for _ in 0..3 {
+            events.push_received(ConnHandle(1), &[0; 4]);
+        }
+
+        assert!(events.received.try_receive().is_ok());
+        assert!(events.received.try_receive().is_err());
     }
 }
