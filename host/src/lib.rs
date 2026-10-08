@@ -132,6 +132,9 @@ mod attribute_server;
 #[cfg(feature = "gatt")]
 pub mod gatt;
 
+#[cfg(feature = "le-audio")]
+pub mod audio;
+
 /// A BLE address.
 /// Every BLE device is identified by a unique *Bluetooth Device Address*, which is a 48-bit identifier similar to a MAC address. BLE addresses are categorized into two main types: *Public* and *Random*.
 ///
