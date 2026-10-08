@@ -42,18 +42,35 @@
 //! `ASE_ID`, so the framing is opcode-aware: [`ControlPointRequest::ase_ids`]
 //! knows which layout to walk. The layouts follow Zephyr's `ascs_internal.h`.
 //!
+//! Every operation is also *exactly* as long as its framing: trailing data is
+//! malformed, not padding. Zephyr rejects it for every opcode, through one
+//! `is_valid_*_len` helper per operation.
+//!
 //! # What is validated
 //!
-//! The framing, the ASE states, and for `Config Codec` the codec itself, the
-//! well-formedness of its configuration, and whether every parameter it carries
-//! is within the advertised capabilities. See [`validate_codec_config`] for the
-//! order those checks run in.
+//! The framing and length, the ASE states, and:
 //!
-//! Still missing: which parameters a configuration is *required* to carry (a
-//! sampling frequency and a frame duration are mandatory, but an incomplete
-//! configuration is currently accepted), and any judgement of the QoS and
-//! metadata parameters. Those are parsed into [`QosConfigBlock`] and
-//! [`MetadataBlock`] but not checked against anything.
+//! * for `Config Codec`, the codec itself, the well-formedness of its
+//!   configuration, and whether every parameter it carries is within the
+//!   advertised capabilities — see [`validate_codec_config`] for the order;
+//! * for `Enable` and `Update Metadata`, that the metadata is well-formed LTV,
+//!   answered with [`AseResponse::InvalidMetadata`].
+//!
+//! # What is deliberately not validated
+//!
+//! **The QoS parameters.** They are parsed into [`QosConfigBlock`] and checked
+//! only for framing. Their meaning — whether the SDU interval suits the codec
+//! configuration, whether the PHY is one the controller can use, whether the
+//! transport latency is achievable — is server policy, not a fixed rule of the
+//! specification. Zephyr reaches the same conclusion structurally: its `ascs.c`
+//! checks the QoS block's *length* and then hands the values to the application
+//! through `ase_qos`. Judging them here would mean inventing a policy and
+//! rejecting configurations a real peer is entitled to send, so the choice is
+//! left to the layer that owns the CIS.
+//!
+//! Also missing: which parameters a codec configuration is *required* to carry.
+//! A sampling frequency and a frame duration are mandatory, but an incomplete
+//! configuration is accepted as long as everything it does carry is supported.
 
 use crate::ase::{Ase, AseDirection, AseOperation, AseResponse};
 use crate::bap::{rate_from_index, PacRecord};
@@ -62,6 +79,16 @@ use crate::types::{AudioLocation, CodecId};
 
 /// Number of ASEs a single operation may address.
 pub const MAX_ASES_PER_OPERATION: usize = 31;
+
+/// Octets of a `Config Codec` entry before its configuration: `ASE_ID`,
+/// `Target_Latency`, `Target_PHY`, `Codec_ID` and the configuration length.
+const CODEC_CONFIG_BLOCK_HEADER: usize = 1 + 1 + 1 + CodecId::SIZE + 1;
+
+/// Octets of a `Config QoS` entry, which has no variable-length part.
+const QOS_CONFIG_BLOCK_LEN: usize = 1 + 1 + 1 + 3 + 1 + 1 + 2 + 1 + 2 + 3;
+
+/// Octets of a metadata entry before its metadata: `ASE_ID` and the length.
+const METADATA_BLOCK_HEADER: usize = 2;
 
 /// The opcode carried by a response, which is never a valid request opcode.
 pub const RESPONSE_OPCODE: u8 = 0x00;
@@ -202,31 +229,40 @@ impl<'a> ControlPointRequest<'a> {
 
         let req = Self { op, count, body };
 
-        // Walk the body now, so that every later access is total.
-        match op {
-            AseOperation::ConfigCodec => {
-                for block in req.config_codec_blocks() {
-                    block?;
-                }
-            }
-            AseOperation::ConfigQos => {
-                for block in req.config_qos_blocks() {
-                    block?;
-                }
-            }
-            AseOperation::Enable | AseOperation::UpdateMetadata => {
-                for block in req.metadata_blocks() {
-                    block?;
-                }
-            }
-            _ => {
-                if req.body.len() < req.count as usize {
-                    return Err(AseResponse::InvalidLength);
-                }
-            }
+        // Every operation is exactly as long as its framing. A short body leaves
+        // a per-ASE block unreadable, and a long one is malformed rather than
+        // padded: Zephyr rejects trailing data for every opcode, and its
+        // `is_valid_*_len` helpers compare the two lengths exactly.
+        if req.framed_len() != Some(body.len()) {
+            return Err(AseResponse::InvalidLength);
         }
 
         Ok(req)
+    }
+
+    /// The number of body octets this operation's framing accounts for.
+    ///
+    /// `None` when a per-ASE block is truncated. Comparing it against the body
+    /// length is what makes the accessors below total.
+    fn framed_len(&self) -> Option<usize> {
+        match self.op {
+            AseOperation::ConfigCodec => {
+                let mut n = 0;
+                for block in self.config_codec_blocks() {
+                    n += CODEC_CONFIG_BLOCK_HEADER + block.ok()?.config.len();
+                }
+                Some(n)
+            }
+            AseOperation::ConfigQos => Some(QOS_CONFIG_BLOCK_LEN * self.count as usize),
+            AseOperation::Enable | AseOperation::UpdateMetadata => {
+                let mut n = 0;
+                for block in self.metadata_blocks() {
+                    n += METADATA_BLOCK_HEADER + block.ok()?.metadata.len();
+                }
+                Some(n)
+            }
+            _ => Some(self.count as usize),
+        }
     }
 
     /// The requested operation.
@@ -408,7 +444,7 @@ impl<'a> Iterator for CodecConfigBlocks<'a> {
 
         // ASE_ID (1), target latency (1), target PHY (1), Codec_ID (5),
         // configuration length (1), configuration (L).
-        const HEADER: usize = 1 + 1 + 1 + CodecId::SIZE + 1;
+        const HEADER: usize = CODEC_CONFIG_BLOCK_HEADER;
         if self.rest.len() < HEADER {
             return Some(Err(AseResponse::InvalidLength));
         }
@@ -487,7 +523,7 @@ impl Iterator for QosConfigBlocks<'_> {
         // ASE_ID (1), CIG_ID (1), CIS_ID (1), SDU interval (3), framing (1),
         // PHY (1), max SDU (2), RTN (1), max transport latency (2),
         // presentation delay (3).
-        const BLOCK: usize = 1 + 1 + 1 + 3 + 1 + 1 + 2 + 1 + 2 + 3;
+        const BLOCK: usize = QOS_CONFIG_BLOCK_LEN;
         if self.rest.len() < BLOCK {
             return Some(Err(AseResponse::InvalidLength));
         }
@@ -862,6 +898,21 @@ fn rejection(ases: &[Ase], caps: &CodecCapabilities<'_>, req: &ControlPointReque
         }
     }
 
+    // Metadata is judged for well-formedness wherever it is carried: `Enable`
+    // carries one block per ASE, and `Update Metadata` carries one too. Zephyr
+    // verifies both through the same helper, and answers a malformed block with
+    // Invalid Metadata.
+    if matches!(req.op(), AseOperation::Enable | AseOperation::UpdateMetadata) {
+        for block in req.metadata_blocks() {
+            let Ok(block) = block else {
+                continue;
+            };
+            if LtvIter::new(block.metadata).is_err() {
+                return Some(AseResponse::InvalidMetadata);
+            }
+        }
+    }
+
     None
 }
 
@@ -966,6 +1017,21 @@ mod tests {
             v.push(2); // RTN
             v.extend_from_slice(&20u16.to_le_bytes()); // max transport latency, ms
             v.extend_from_slice(&[0x40, 0x9C, 0x00]); // presentation delay: 40 000 us
+        }
+        v
+    }
+
+    /// Build an `Enable` (0x03) or `Update Metadata` (0x07) request, one entry
+    /// per `(ase_id, metadata)`.
+    ///
+    /// Each entry is `ASE_ID | Length | Metadata`, interleaved rather than
+    /// listed.
+    fn metadata_op(op: u8, entries: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut v = std::vec![op, entries.len() as u8];
+        for (ase_id, metadata) in entries {
+            v.push(*ase_id);
+            v.push(metadata.len() as u8);
+            v.extend_from_slice(metadata);
         }
         v
     }
@@ -1315,5 +1381,84 @@ mod tests {
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert_eq!(resp.entries()[0].code, AseResponse::UnsupportedCodecConfiguration);
         assert_eq!(resp.entries()[0].reason, 0x00);
+    }
+
+    #[test]
+    fn rejects_trailing_data() {
+        // Every operation is exactly as long as its framing.
+        assert_eq!(
+            ControlPointRequest::parse(&[0x08, 0x01, 0x00, 0xAA]),
+            Err(AseResponse::InvalidLength)
+        );
+
+        let mut data = config_qos(&[(0x00, 0x00, 0x00)]);
+        data.push(0xAA);
+        assert_eq!(ControlPointRequest::parse(&data), Err(AseResponse::InvalidLength));
+
+        // The exact-length form is still accepted.
+        assert!(ControlPointRequest::parse(&config_qos(&[(0x00, 0x00, 0x00)])).is_ok());
+    }
+
+    #[test]
+    fn enable_carries_per_ase_metadata() {
+        let data = metadata_op(0x03, &[(0x00, &[0x03, 0x02, 0x04, 0x00]), (0x01, &[])]);
+        let req = ControlPointRequest::parse(&data).unwrap();
+        assert_eq!(req.op(), AseOperation::Enable);
+        assert_eq!(req.ase_ids().as_slice(), &[0x00, 0x01]);
+
+        let mut blocks = req.metadata_blocks();
+        let first = blocks.next().unwrap().unwrap();
+        assert_eq!(first.ase_id, 0x00);
+        assert_eq!(first.metadata, &[0x03, 0x02, 0x04, 0x00]);
+        let second = blocks.next().unwrap().unwrap();
+        assert_eq!(second.ase_id, 0x01);
+        assert!(second.metadata.is_empty());
+        assert!(blocks.next().is_none());
+    }
+
+    #[test]
+    fn update_metadata_needs_an_enabling_or_streaming_ase() {
+        let mut ases = [Ase::new(0, AseDirection::Sink)];
+        ases[0].handle(AseOperation::ConfigCodec);
+        ases[0].handle(AseOperation::ConfigQos);
+
+        let data = metadata_op(0x07, &[(0x00, &[])]);
+        let req = ControlPointRequest::parse(&data).unwrap();
+
+        // QoS Configured is too early.
+        let resp = apply(&mut ases, &CodecCapabilities::NONE, &req);
+        assert_eq!(resp.entries()[0].code, AseResponse::InvalidAseState);
+        assert_eq!(ases[0].state(), crate::AseState::QosConfigured);
+
+        // Once enabling, the same request is accepted and the state is unchanged.
+        ases[0].handle(AseOperation::Enable);
+        let resp = apply(&mut ases, &CodecCapabilities::NONE, &req);
+        assert!(resp.entries()[0].code.is_success());
+        assert_eq!(ases[0].state(), crate::AseState::Enabling);
+    }
+
+    #[test]
+    fn a_malformed_metadata_block_is_invalid_metadata() {
+        let mut ases = [Ase::new(0, AseDirection::Sink)];
+        // Drive the ASE to Enabling, where Update Metadata is allowed, so that
+        // the metadata is what fails rather than the state.
+        ases[0].handle(AseOperation::ConfigCodec);
+        ases[0].handle(AseOperation::ConfigQos);
+        ases[0].handle(AseOperation::Enable);
+
+        // An LTV entry claiming a length of five while supplying two octets.
+        let data = metadata_op(0x07, &[(0x00, &[0x05, 0x01, 0x08])]);
+        let req = ControlPointRequest::parse(&data).unwrap();
+        let resp = apply(&mut ases, &CodecCapabilities::NONE, &req);
+
+        assert_eq!(resp.entries()[0].code, AseResponse::InvalidMetadata);
+        assert_eq!(resp.entries()[0].reason, 0x00);
+        assert_eq!(ases[0].state(), crate::AseState::Enabling);
+
+        // A well-formed block is accepted.
+        let data = metadata_op(0x07, &[(0x00, &[0x03, 0x02, 0x04, 0x00])]);
+        let req = ControlPointRequest::parse(&data).unwrap();
+        let resp = apply(&mut ases, &CodecCapabilities::NONE, &req);
+        assert!(resp.entries()[0].code.is_success());
     }
 }
