@@ -217,12 +217,80 @@ covers a 40-octet SDU. These values are corroborated by the host's own startup l
 `setting txq to 8, fragmenting at 251` from the version 1 query — an independent check that the direct
 call returns real data rather than an uninitialised buffer.
 
-Two things to pin down next, both of which need a peer and so cannot be tested against a single board:
+== Two-board bring-up: current state
 
-* The out-parameter is a `uint8_t*`, while `ll_intf_le_create_cis` expects 16-bit `cis_conn_hndl` and
-  `acl_conn_hndl` pairs, so how the returned handle maps onto what `create_cis` wants is still open.
-* `ll_intf_le_create_cis` requires an established ACL connection, so CIS setup needs a second LE Audio
-  device from here on.
+A second NUCLEO-WBA65RI was attached, and the two boards now run `iso_sink` and `iso_central` against each
+other. That answers both questions above: the `uint8_t` out-parameter is used directly as
+`cis_conn_hndl`, and CIS setup does need a peer.
+
+=== Working
+
+The two boards connect deterministically, both running `trouble-host` over the ST link layer. Connect times
+measured across runs: 11 ms, 47 ms, 63 ms, 76 ms — one connection, no timeouts. `ll_intf_le_set_cig_params`
+returns `ble_stat_t = 0x00` and reports CIS handle 8.
+
+=== Blocked: `ll_intf_le_create_cis` returns `0x1f`
+
+`0x1f` is the generic HCI *Unspecified Error*. ST's own statuses begin at `0x59`, so this is not an
+ST-specific condition that can be looked up. The handle pair itself is provably correct:
+
+[cols="1,2"]
+|===
+| call | result
+
+| `(cis=8, acl=0)` | `0x1f`
+| `(cis=8, acl=1)`, `(8,2)`, `(0,0)`, `(1,0)`, `(8,8)` | `0x02` *Unknown Connection Identifier*
+|===
+
+Only the correct pair escapes `0x02`, so the link layer recognises it and then refuses internally. The
+implementation is inside a prebuilt archive, so the remaining parameters cannot be reasoned about further.
+
+Eliminated by measurement:
+
+* **The HCI route.** `LE Set CIG Parameters` (0x062) and `LE Set CIG Parameters Test` (0x063), both
+  correctly encoded, return `0x12` from this stack; the direct `ll_intf_*` call returns `0x00`. In the
+  link-layer-only configuration the ISO commands must be issued through the `ll_intf_*` API — the HCI front
+  door for them is not implemented.
+* **ISO interval.** 5 ms and 10 ms fail identically.
+* **Transport latency against RTN.** 20 ms and 60 ms fail identically.
+* **Command ordering** relative to the platform runner. Identical in working and failing runs.
+
+Not yet tried: `ll_intf_le_set_cig_params_test` with explicit Max_PDU and BN; a sweep over `iso_interval`,
+`framing`, `packing`, `phy` and `ft`; and a valid short ACL connection interval, since 10 ms/10 ms is
+rejected outright by `LE Create Connection`.
+
+=== A trap worth recording
+
+`pkill -x probe-rs` detaches the debugger but leaves the firmware running. Flashing the two boards minutes
+apart therefore leaves the second board's *previous* firmware alive and connected to the first, and the new
+firmware's `connect()` then waits forever for a completion event that can no longer arrive. The sequencer
+spins, no events are delivered, and it looks exactly like a race in the event path. Reset both boards, or
+flash them together.
+
+=== Reproducing
+
+[source,bash]
+----
+DEFMT_LOG=debug CARGO_PROFILE_RELEASE_DEBUG=2 cargo build --release \
+  --manifest-path examples/stm32wba6/Cargo.toml --no-default-features \
+  --features stm32wba65ri-iso --bin iso_sink --bin iso_central --target thumbv8m.main-none-eabihf
+
+probe-rs reset --chip STM32WBA65RI --probe <sink probe>
+probe-rs reset --chip STM32WBA65RI --probe <central probe>
+probe-rs run --chip STM32WBA65RI --probe <sink probe> iso_sink &
+probe-rs run --chip STM32WBA65RI --probe <central probe> iso_central
+----
+
+`DEFMT_LOG` must be set explicitly: cargo does not read the example's `.cargo/config.toml` when it is
+invoked from the repository root, and without it every log statement is compiled out.
+
+=== Local patches these binaries need
+
+`iso_sink`, `iso_central` and `iso_tx_probe` are built against local patches that are not committed here.
+`bt-hci` needs a send-side `IsoPacket` constructor — there is none upstream, so an ISO packet can be parsed
+but not built — and `embassy-stm32-wpan` needs `write_iso_data` implemented for the WBA (it is `todo!()`
+upstream) together with the `ll_intf_*` ISO paths. All are behind `required-features`, so none of them can
+break a normal build of this example.
 
 == Related: ST's own audio stack is already available
 
