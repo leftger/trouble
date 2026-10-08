@@ -24,9 +24,9 @@
 //! The next step is to extend this with `LE Set CIG Parameters`, which allocates a
 //! CIG/CIS in the controller and needs no peer device.
 
-use bt_hci::cmd::le::{LeReadBufferSizeV2, LeReadLocalSupportedFeatures, LeRemoveCig};
+use bt_hci::cmd::le::{LeReadBufferSizeV2, LeReadLocalSupportedFeatures, LeRemoveCig, LeSetCigParameters};
 use bt_hci::controller::ControllerCmdSync;
-use bt_hci::param::CigId;
+use bt_hci::param::{CigId, CisConfig, CisId, ExtDuration, Framing, Packing, PhyMask};
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
@@ -98,7 +98,8 @@ where
     C: Controller
         + ControllerCmdSync<LeReadLocalSupportedFeatures>
         + ControllerCmdSync<LeReadBufferSizeV2>
-        + ControllerCmdSync<LeRemoveCig>,
+        + ControllerCmdSync<LeRemoveCig>
+        + for<'a> ControllerCmdSync<LeSetCigParameters<'a>>,
 {
     let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
 
@@ -149,12 +150,74 @@ where
             }
         }
 
-        // 3. Is the ISO command surface implemented at all?
+        // 3. Allocate a CIG. This is entirely local: no peer and no ACL connection
+        //    are required, so it exercises the ISO resource machinery by itself.
         //
-        // `LE Remove CIG` for a CIG that was never allocated is a cheap probe: a
-        // controller implementing the ISO command set answers "Unknown Connection
-        // Identifier" (0x02), while one that does not know the opcode answers
-        // "Unknown HCI Command" (0x01).
+        //    One CIS carrying 48 kHz / 10 ms mono, 40-octet SDUs, unframed, 2M PHY.
+        //
+        //    KNOWN FAILURE: as of bt-hci 0.10.1 this is rejected with
+        //    "Invalid HCI Command Parameters" (0x12) by any spec-conforming
+        //    controller, because bt-hci encodes `LeSetCigParameters` using the
+        //    parameter layout of `LE Set CIG Parameters Test` (OCF 0x063) while
+        //    sending the real opcode 0x062.
+        //
+        //    Spec / ST `ble_hci_le.h` order for 0x062:
+        //        CIG_ID, SDU_C_To_P, SDU_P_To_C, Worst_Case_SCA, Packing, Framing,
+        //        Max_Transport_Latency_C_To_P, Max_Transport_Latency_P_To_C,
+        //        CIS_Count, per-CIS...
+        //    bt-hci emits:
+        //        CIG_ID, SDU_C_To_P, SDU_P_To_C, FT_C_To_P, FT_P_To_C, ISO_Interval,
+        //        Worst_Case_SCA, Packing, Framing, CIS_Count, per-CIS...
+        //
+        //    Both variants happen to total 24 octets, so the reported parameter
+        //    length is correct and the mismatch is invisible in `param_len`. The
+        //    controller reads the second encoded octet (0x02) as `Packing`, which
+        //    is out of range, and rejects the command.
+        //
+        //    The bytes are verified by `bt-hci`'s own writer; the probe is left in
+        //    place because it will start passing once bt-hci is corrected.
+        let phy = PhyMask::new().set_le_2m_phy(true);
+        let cis_configs = [CisConfig {
+            cis_id: CisId::new(0),
+            max_sdu_c_to_p: 40,
+            max_sdu_p_to_c: 40,
+            phy_c_to_p: phy,
+            phy_p_to_c: phy,
+            rtn_c_to_p: 2,
+            rtn_p_to_c: 2,
+        }];
+        let cig_id = CigId::new(0);
+        let set_cig = LeSetCigParameters::new(
+            cig_id,
+            ExtDuration::<1>::from_micros(10_000), // SDU interval, central to peripheral
+            ExtDuration::<1>::from_micros(10_000), // SDU interval, peripheral to central
+            2,                                     // flush timeout, in ISO intervals
+            2,                                     // flush timeout, in ISO intervals
+            8,                                     // ISO interval: 8 * 1.25 ms = 10 ms
+            0,                                     // worst case sleep clock accuracy
+            Packing::Sequential,
+            Framing::Unframed,
+            &cis_configs,
+        );
+        match iso.command(set_cig).await {
+            Ok(r) => {
+                // `LeSetCigParametersReturn` is packed, so copy the fields out.
+                let num_cis = r.num_cis;
+                let first_cis = r.cis_handles[0].0;
+                info!(
+                    "LE Set CIG Parameters: cig_id={} num_cis={} first_cis_handle={}",
+                    cig_id.into_inner(),
+                    num_cis,
+                    first_cis
+                );
+            }
+            Err(e) => {
+                let e = Debug2Format(&e);
+                error!("LE Set CIG Parameters failed: {:?}", e);
+            }
+        }
+
+        // 4. Release it again. CIG 0 now exists, so this should succeed.
         match iso.command(LeRemoveCig::new(CigId::new(0))).await {
             Ok(r) => {
                 let cig_id = r.cig_id.into_inner();
