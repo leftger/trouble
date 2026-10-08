@@ -306,8 +306,11 @@ impl Ase {
             (ReceiverStopReady, Disabling, AseDirection::Sink) => QosConfigured,
             (ReceiverStopReady, _, AseDirection::Source) => return AseResponse::InvalidAseDirection,
 
-            // Metadata may be updated in any configured state, without a transition.
-            (UpdateMetadata, CodecConfigured | QosConfigured | Enabling | Streaming | Disabling, _) => self.state,
+            // Metadata may be updated only once the stream is being enabled or is
+            // already streaming, and the state does not change. Zephyr's
+            // `ase_metadata` names exactly those two states, so anything earlier
+            // is Invalid ASE State.
+            (UpdateMetadata, Enabling | Streaming, _) => self.state,
 
             // Release is allowed from every state except Idle.
             (Release, CodecConfigured | QosConfigured | Enabling | Streaming | Disabling | Releasing, _) => Releasing,
