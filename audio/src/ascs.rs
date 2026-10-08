@@ -723,9 +723,9 @@ pub fn validate_codec_config(
 /// advertise, is [`AseResponse::UnsupportedCodecConfiguration`].
 ///
 /// `Supported_Audio_Channel_Counts` is read as `bit (n - 1)` meaning `n`
-/// channels: there is no such thing as a stream with zero channels, so bit 0 has
-/// to mean one channel. That convention should be confirmed against the
-/// specification, since getting it backwards would reject valid configurations.
+/// channels. Zephyr's `BT_CODEC_CAP_CHAN_COUNT` builds the field as
+/// `(BIT(n) | ...) >> 1`, which lands one channel on bit 0 — and there is no such
+/// thing as a stream with zero channels, so bit 0 could not mean anything else.
 fn config_within_capabilities(config: &[u8], caps: &[u8]) -> AseResponse {
     use crate::ltv::{cap, cfg};
 
