@@ -90,6 +90,70 @@ impl From<AseResponse> for AscsError {
     }
 }
 
+/// The parameter a rejected or invalid configuration was refused over.
+///
+/// This is the `Reason` octet of a response. The values are ST's, from
+/// `audio_types.h`. The specification defines a reason for the rejected and
+/// invalid codec, QoS and metadata codes, so every other code carries
+/// [`Reason::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// No reason, or a code that does not carry one.
+    None,
+    /// The codec itself.
+    CodecId,
+    /// A codec-specific configuration parameter.
+    CodecSpecificConfiguration,
+    /// The SDU interval.
+    SduInterval,
+    /// The ISOAL framing mode.
+    Framing,
+    /// The PHY.
+    Phy,
+    /// The maximum SDU size.
+    MaxSdu,
+    /// The retransmission number.
+    RetransmissionNumber,
+    /// The maximum transport latency.
+    MaxTransportLatency,
+    /// The presentation delay.
+    PresentationDelay,
+}
+
+impl Reason {
+    /// The wire value.
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Reason::None => 0x00,
+            Reason::CodecId => 0x01,
+            Reason::CodecSpecificConfiguration => 0x02,
+            Reason::SduInterval => 0x03,
+            Reason::Framing => 0x04,
+            Reason::Phy => 0x05,
+            Reason::MaxSdu => 0x06,
+            Reason::RetransmissionNumber => 0x07,
+            Reason::MaxTransportLatency => 0x08,
+            Reason::PresentationDelay => 0x09,
+        }
+    }
+
+    /// The reason to report alongside `code`.
+    ///
+    /// A malformed or out-of-range codec configuration is what this module
+    /// reports today, so it names the codec-specific configuration. The QoS and
+    /// metadata codes will need their own reason once those parameters are
+    /// validated — and that reason has to name the parameter actually at fault,
+    /// which is why one is not guessed at here.
+    pub const fn for_code(code: AseResponse) -> Self {
+        match code {
+            AseResponse::RejectedCodecConfiguration | AseResponse::InvalidCodecConfiguration => {
+                Reason::CodecSpecificConfiguration
+            }
+            _ => Reason::None,
+        }
+    }
+}
+
 /// A parsed ASE Control Point request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPointRequest<'a> {
@@ -619,7 +683,7 @@ pub fn apply(ases: &mut [Ase], caps: &CodecCapabilities<'_>, req: &ControlPointR
                 AseResponse::Success
             }
         };
-        resp.push(id, code, 0);
+        resp.push(id, code, Reason::for_code(code).to_u8());
     }
 
     resp
@@ -931,5 +995,61 @@ mod tests {
         let req = ControlPointRequest::parse(&outside).unwrap();
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert_eq!(resp.entries()[0].code, AseResponse::UnsupportedCodecConfiguration);
+    }
+
+    #[test]
+    fn reason_codes_match_the_vendor_table() {
+        assert_eq!(Reason::None.to_u8(), 0x00);
+        assert_eq!(Reason::CodecId.to_u8(), 0x01);
+        assert_eq!(Reason::CodecSpecificConfiguration.to_u8(), 0x02);
+        assert_eq!(Reason::SduInterval.to_u8(), 0x03);
+        assert_eq!(Reason::Framing.to_u8(), 0x04);
+        assert_eq!(Reason::Phy.to_u8(), 0x05);
+        assert_eq!(Reason::MaxSdu.to_u8(), 0x06);
+        assert_eq!(Reason::RetransmissionNumber.to_u8(), 0x07);
+        assert_eq!(Reason::MaxTransportLatency.to_u8(), 0x08);
+        assert_eq!(Reason::PresentationDelay.to_u8(), 0x09);
+    }
+
+    #[test]
+    fn only_invalid_and_rejected_codes_carry_a_reason() {
+        // An invalid codec configuration names the codec-specific configuration.
+        assert_eq!(
+            Reason::for_code(AseResponse::InvalidCodecConfiguration),
+            Reason::CodecSpecificConfiguration
+        );
+        // Codes that do not carry a reason must not invent one.
+        for code in [
+            AseResponse::Success,
+            AseResponse::UnsupportedOpcode,
+            AseResponse::InvalidLength,
+            AseResponse::InvalidAseId,
+            AseResponse::InvalidAseState,
+            AseResponse::UnsupportedAudioCapability,
+            AseResponse::UnsupportedCodecConfiguration,
+            AseResponse::InsufficientResources,
+        ] {
+            assert_eq!(Reason::for_code(code), Reason::None);
+        }
+    }
+
+    #[test]
+    fn a_response_carries_the_reason_for_an_invalid_configuration() {
+        let records = lc3_caps();
+        let mut ases = [Ase::new(0, AseDirection::Sink)];
+        // A three-octet configuration whose first LTV claims a length of five.
+        let data = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x05, 0x01, 0x08];
+        let req = ControlPointRequest::parse(&data).unwrap();
+        let resp = apply(&mut ases, &with_sink(&records), &req);
+
+        assert_eq!(resp.entries()[0].code, AseResponse::InvalidCodecConfiguration);
+        assert_eq!(resp.entries()[0].reason, 0x02);
+
+        // And an unsupported value carries no reason.
+        let unsupported = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x03];
+        let req = ControlPointRequest::parse(&unsupported).unwrap();
+        let resp = apply(&mut ases, &with_sink(&records), &req);
+        assert_eq!(resp.entries()[0].code, AseResponse::UnsupportedCodecConfiguration);
+        assert_eq!(resp.entries()[0].reason, 0x00);
     }
 }

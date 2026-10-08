@@ -11,16 +11,18 @@
 //! +-----------+----------------+---------------+--------------+----------+
 //! ```
 //!
-//! The Config QoS operation payload for one ASE is 13 octets:
-//!
-//! ```text
-//! SDU_Interval (3) | Framing (1) | PHY (1) | Max_SDU (2)
-//!   | RTN (1) | Max_Transport_Latency (2) | Presentation_Delay (3)
-//! ```
+//! [`QosConfig`] is a *single direction* view of a QoS configuration: one SDU
+//! interval, one maximum SDU, and the shared framing, PHY, retransmission number,
+//! transport latency and presentation delay. It mirrors ST's `BAP_ASEQoSConf_t`,
+//! which is likewise per-ASE. The layout of the `Config QoS` *operation* payload,
+//! which can carry both directions at once, has not been established — generated
+//! summaries of the specification disagree on its length (13, 15 and 18 octets
+//! have all been offered), so it should be read off the specification or a
+//! reference implementation before this type is used to parse one.
 //!
 //! The ASE Control Point framing that carries this payload (opcode,
-//! number-of-ASEs, ASE ID) is *not* modelled here yet; it belongs with the ASCS
-//! service implementation. Only the per-ASE parameter blocks are handled.
+//! number-of-ASEs, ASE ID) is not modelled here; it belongs with the ASCS service
+//! implementation.
 
 use crate::ltv::{self, LtvError};
 use crate::types::{AudioLocation, CodecId, FrameDuration, Framing, Phy, SampleRate};
