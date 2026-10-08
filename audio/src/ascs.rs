@@ -46,17 +46,21 @@
 //!
 //! # What is validated
 //!
-//! The framing, the ASE states, and — for `Config Codec` — the codec itself and
-//! the well-formedness of its configuration. See [`validate_codec_config`] for
-//! the order those checks run in and for what is deliberately still missing: a
-//! well-formed configuration is not yet compared against the advertised
-//! capabilities, and a request's QoS and metadata parameters are not yet
-//! interpreted. For that reason [`apply`] always writes a zero `Reason`.
+//! The framing, the ASE states, and for `Config Codec` the codec itself, the
+//! well-formedness of its configuration, and whether every parameter it carries
+//! is within the advertised capabilities. See [`validate_codec_config`] for the
+//! order those checks run in.
+//!
+//! Still missing: which parameters a configuration is *required* to carry (a
+//! sampling frequency and a frame duration are mandatory, but an incomplete
+//! configuration is currently accepted), and any interpretation of a request's
+//! QoS and metadata parameters. For that reason [`apply`] always writes a zero
+//! `Reason`.
 
 use crate::ase::{Ase, AseDirection, AseOperation, AseResponse};
-use crate::bap::PacRecord;
-use crate::ltv::LtvIter;
-use crate::types::CodecId;
+use crate::bap::{rate_from_index, PacRecord};
+use crate::ltv::{self, LtvIter};
+use crate::types::{AudioLocation, CodecId};
 
 /// Number of ASEs a single operation may address.
 pub const MAX_ASES_PER_OPERATION: usize = 31;
@@ -400,26 +404,138 @@ impl<'a> CodecCapabilities<'a> {
 ///    codec, not against what the server supports, so it takes precedence over
 ///    the check below.
 /// 3. Each entry must be within the advertised codec-specific capabilities,
-///    otherwise [`AseResponse::UnsupportedCodecConfiguration`].
+///    otherwise [`AseResponse::UnsupportedCodecConfiguration`] — see
+///    [`config_within_capabilities`] for the rule each parameter uses.
 ///
-/// Step 3 is **not implemented yet**. Comparing a requested value against the
-/// advertised capability needs a rule per parameter type, because the two sides
-/// are not encoded the same way — a configured sampling frequency is an ordinal
-/// while the capability is a bitfield, and a channel allocation has to be a
-/// subset rather than an equal value. Until that is written, a well-formed
-/// configuration is therefore accepted even when the server could not actually
-/// support it; the advertisement and the validation must be finished together.
+/// What is *not* checked yet is which parameters a configuration has to carry. A
+/// codec configuration must specify at least a sampling frequency and a frame
+/// duration, but an incomplete one is currently accepted as long as everything it
+/// does carry is supported.
 pub fn validate_codec_config(
     block: &CodecConfigBlock<'_>,
     direction: AseDirection,
     caps: &CodecCapabilities<'_>,
 ) -> AseResponse {
-    if !caps.records(direction).iter().any(|r| r.codec_id == block.codec_id) {
+    let Some(record) = caps.records(direction).iter().find(|r| r.codec_id == block.codec_id) else {
         return AseResponse::UnsupportedAudioCapability;
-    }
+    };
 
+    // Well-formedness is judged against the codec, not against the server, so it
+    // precedes the capability comparison below.
     if block.config.is_empty() || LtvIter::new(block.config).is_err() {
         return AseResponse::InvalidCodecConfiguration;
+    }
+
+    config_within_capabilities(block.config, record.codec_specific_capabilities)
+}
+
+/// Compare a well-formed codec configuration against the advertised capabilities.
+///
+/// Each parameter needs its own rule, because the two sides are not encoded the
+/// same way:
+///
+/// * a configured *sampling frequency* is an ordinal (`0x08` = 48 kHz) while the
+///   capability is a bitfield (`0x0080`), so the ordinal is translated to a bit
+///   before the capability is tested;
+/// * a configured *frame duration* is a bitfield on both sides, so the requested
+///   bit has to be present in the capability;
+/// * a configured *channel allocation* names physical loudspeaker locations while
+///   the capability only advertises how many channels are supported, so this
+///   compares the number of allocated channels rather than the locations;
+/// * *octets per codec frame* is a single value against a minimum and a maximum;
+/// * *codec frames per SDU* is a maximum, so any value up to it is acceptable.
+///
+/// A parameter this implementation does not know, or one the capability does not
+/// advertise, is [`AseResponse::UnsupportedCodecConfiguration`].
+///
+/// `Supported_Audio_Channel_Counts` is read as `bit (n - 1)` meaning `n`
+/// channels: there is no such thing as a stream with zero channels, so bit 0 has
+/// to mean one channel. That convention should be confirmed against the
+/// specification, since getting it backwards would reject valid configurations.
+fn config_within_capabilities(config: &[u8], caps: &[u8]) -> AseResponse {
+    use crate::ltv::{cap, cfg};
+
+    let Ok(entries) = LtvIter::new(config) else {
+        return AseResponse::InvalidCodecConfiguration;
+    };
+
+    for entry in entries {
+        match entry.ty {
+            cfg::SAMPLING_FREQUENCY => {
+                let Some(ordinal) = entry.value.first().copied() else {
+                    return AseResponse::InvalidCodecConfiguration;
+                };
+                let Some(rate) = rate_from_index(ordinal) else {
+                    return AseResponse::InvalidCodecConfiguration;
+                };
+                match ltv::find(caps, cap::SUPPORTED_SAMPLING_FREQUENCIES).and_then(|e| e.as_u16()) {
+                    Some(supported) if supported & rate.bit() != 0 => {}
+                    _ => return AseResponse::UnsupportedCodecConfiguration,
+                }
+            }
+
+            cfg::FRAME_DURATION => {
+                let Some(requested) = entry.value.first().copied() else {
+                    return AseResponse::InvalidCodecConfiguration;
+                };
+                let supported = ltv::find(caps, cap::SUPPORTED_FRAME_DURATIONS).and_then(|e| e.value.first().copied());
+                match supported {
+                    Some(bits) if bits & requested != 0 => {}
+                    _ => return AseResponse::UnsupportedCodecConfiguration,
+                }
+            }
+
+            cfg::AUDIO_CHANNEL_ALLOCATION => {
+                let Some(value) = entry.as_u32() else {
+                    return AseResponse::InvalidCodecConfiguration;
+                };
+                let channels = AudioLocation(value).count();
+                let supported = ltv::find(caps, cap::SUPPORTED_AUDIO_CHANNEL_COUNTS).and_then(|e| e.as_u32());
+                match supported {
+                    Some(bits) if (1..=32).contains(&channels) => {
+                        if bits & (1u32 << (channels - 1)) == 0 {
+                            return AseResponse::UnsupportedCodecConfiguration;
+                        }
+                    }
+                    _ => return AseResponse::UnsupportedCodecConfiguration,
+                }
+            }
+
+            cfg::OCTETS_PER_CODEC_FRAME => {
+                let Some(value) = entry.as_u16() else {
+                    return AseResponse::InvalidCodecConfiguration;
+                };
+                let range = ltv::find(caps, cap::SUPPORTED_OCTETS_PER_CODEC_FRAME).and_then(|e| {
+                    if e.value.len() >= 4 {
+                        Some((
+                            u16::from_le_bytes([e.value[0], e.value[1]]),
+                            u16::from_le_bytes([e.value[2], e.value[3]]),
+                        ))
+                    } else {
+                        None
+                    }
+                });
+                match range {
+                    Some((min, max)) if value >= min && value <= max => {}
+                    _ => return AseResponse::UnsupportedCodecConfiguration,
+                }
+            }
+
+            cfg::CODEC_FRAMES_PER_SDU => {
+                let Some(value) = entry.value.first().copied() else {
+                    return AseResponse::InvalidCodecConfiguration;
+                };
+                let supported =
+                    ltv::find(caps, cap::SUPPORTED_MAX_CODEC_FRAMES_PER_SDU).and_then(|e| e.value.first().copied());
+                match supported {
+                    Some(max) if value >= 1 && value <= max => {}
+                    _ => return AseResponse::UnsupportedCodecConfiguration,
+                }
+            }
+
+            // A parameter this implementation does not know cannot be honoured.
+            _ => return AseResponse::UnsupportedCodecConfiguration,
+        }
     }
 
     AseResponse::Success
@@ -751,5 +867,69 @@ mod tests {
         let resp = apply(&mut ases, &with_sink(&records), &req);
         assert!(resp.entries()[0].code.is_success());
         assert_eq!(ases[0].state(), crate::AseState::CodecConfigured);
+    }
+
+    #[test]
+    fn config_codec_rejects_an_unsupported_parameter_value() {
+        // The record advertises 48 kHz only, so 16 kHz is a well-formed
+        // configuration the server cannot support: Unsupported, not Invalid.
+        let records = lc3_caps();
+        let mut ases = [Ase::new(0, AseDirection::Sink)];
+        // Sampling_Frequency ordinal 0x03 is 16 kHz.
+        let data = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x03];
+        let req = ControlPointRequest::parse(&data).unwrap();
+        let resp = apply(&mut ases, &with_sink(&records), &req);
+
+        assert_eq!(resp.entries()[0].code, AseResponse::UnsupportedCodecConfiguration);
+        assert_eq!(ases[0].state(), crate::AseState::Idle);
+    }
+
+    #[test]
+    fn config_codec_treats_an_unknown_ordinal_as_invalid() {
+        // 0x02 is not a defined sampling frequency ordinal, so the configuration
+        // is wrong whatever the server supports.
+        let records = lc3_caps();
+        let mut ases = [Ase::new(0, AseDirection::Sink)];
+        let data = [0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x02];
+        let req = ControlPointRequest::parse(&data).unwrap();
+        let resp = apply(&mut ases, &with_sink(&records), &req);
+
+        assert_eq!(resp.entries()[0].code, AseResponse::InvalidCodecConfiguration);
+    }
+
+    #[test]
+    fn config_codec_checks_octets_per_frame_against_the_advertised_range() {
+        // 48 kHz, 7.5 or 10 ms, and 40..=120 octets per codec frame.
+        const CAPS: &[u8] = &[
+            0x03, 0x01, 0x80, 0x00, // supported sampling frequencies: 48 kHz
+            0x02, 0x02, 0x03, // supported frame durations: 7.5 ms and 10 ms
+            0x05, 0x04, 40, 0, 120, 0, // octets per codec frame: 40..=120
+        ];
+        let records = [PacRecord {
+            codec_id: CodecId::LC3,
+            codec_specific_capabilities: CAPS,
+            metadata: &[],
+        }];
+        let mut ases = [Ase::new(0, AseDirection::Sink)];
+
+        // A ten-octet configuration: 48 kHz, 10 ms, 40 octets.
+        let inside = [
+            0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x0A, // Config Codec, ASE 0, len 10
+            0x02, 0x01, 0x08, // sampling frequency 48 kHz
+            0x02, 0x02, 0x02, // frame duration 10 ms
+            0x03, 0x04, 40, 0, // 40 octets per codec frame
+        ];
+        let req = ControlPointRequest::parse(&inside).unwrap();
+        let resp = apply(&mut ases, &with_sink(&records), &req);
+        assert!(resp.entries()[0].code.is_success());
+
+        // The same, but 200 octets, above the advertised maximum.
+        let outside = [
+            0x01, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x02, 0x01, 0x08, 0x02, 0x02, 0x02, 0x03, 0x04, 200,
+            0,
+        ];
+        let req = ControlPointRequest::parse(&outside).unwrap();
+        let resp = apply(&mut ases, &with_sink(&records), &req);
+        assert_eq!(resp.entries()[0].code, AseResponse::UnsupportedCodecConfiguration);
     }
 }

@@ -30,10 +30,10 @@
 //! format, QoS configuration, the ASE state machine, the ASE Control Point
 //! framing with its multi-ASE orchestration, validation of a codec configuration
 //! against the advertised capabilities, and the codec abstraction.
-//! Not yet implemented: a comparison of a well-formed codec configuration against
-//! the advertised capability *values*, interpretation of the QoS and metadata
-//! parameters, the PACS/ASCS GATT services, CIS setup, and ISO streaming glue —
-//! those land in a follow-up and the services will depend on `trouble-host`.
+//! Not yet implemented: which parameters a codec configuration is required to
+//! carry, interpretation of the QoS and metadata parameters, the PACS/ASCS GATT
+//! services, CIS setup, and ISO streaming glue — those land in a follow-up and
+//! the services will depend on `trouble-host`.
 
 #![no_std]
 #![warn(missing_docs)]
