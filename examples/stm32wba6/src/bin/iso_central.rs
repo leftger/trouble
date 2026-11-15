@@ -34,17 +34,13 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_futures::select::{Either, select};
-use embassy_stm32::aes::{self, Aes};
-use embassy_stm32::peripherals::{AES, PKA, RNG};
-use embassy_stm32::pka::{self, Pka};
 use embassy_stm32::rcc;
-use embassy_stm32::rng::{self, Rng};
 use embassy_stm32::{Config, bind_interrupts};
 use embassy_stm32_wpan::controller::ControllerAdapter;
 // The WBA stack type, aliased: `Controller` is the trouble-host trait this file
 // bounds its tasks on, and the two would collide.
 use embassy_stm32_wpan::{
-    Controller as WbaController, HighInterruptHandler, LowInterruptHandler, Platform, Runtime, new_platform,
+    Controller as WbaController, HighInterruptHandler, LowInterruptHandler, Platform, new_platform,
 };
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_time::{Duration, Timer};
@@ -54,9 +50,6 @@ use trouble_host::iso::IsoEvents;
 use trouble_host::prelude::*;
 
 bind_interrupts!(struct Irqs {
-    RNG => rng::InterruptHandler<RNG>;
-    AES => aes::InterruptHandler<AES>;
-    PKA => pka::InterruptHandler<PKA>;
     RADIO => HighInterruptHandler;
     HASH => LowInterruptHandler;
 });
@@ -170,15 +163,10 @@ async fn main(spawner: Spawner) {
     let mut config = Config::default();
     config.rcc = rcc::Config::new_wpan();
 
-    let p = embassy_stm32::init(config);
+    let _p = embassy_stm32::init(config);
     info!("STM32WBA6 ISO central");
 
-    let (platform, runtime) = new_platform!(
-        Rng::new(p.RNG, Irqs),
-        Pka::new(p.PKA, Irqs),
-        Aes::new_blocking(p.AES, Irqs),
-        8
-    );
+    let (platform, runtime) = new_platform!(8);
 
     spawner.spawn(ble_runner_task(platform).expect("Failed to spawn BLE runner"));
 
@@ -190,7 +178,7 @@ async fn main(spawner: Spawner) {
     run(ControllerAdapter::new(ble)).await;
 }
 
-async fn run<T: Runtime>(controller: ControllerAdapter<'_, T>) {
+async fn run(controller: ControllerAdapter<'_>) {
     let mut resources: HostResources<DefaultPacketPool, 1, 3> = HostResources::new();
     let stack = trouble_host::new(controller, &mut resources)
         .set_random_address(Address::random(CENTRAL_ADDRESS))

@@ -21,11 +21,7 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_futures::select::{Either, select};
-use embassy_stm32::aes::{self, Aes};
-use embassy_stm32::peripherals::{AES, PKA, RNG};
-use embassy_stm32::pka::{self, Pka};
 use embassy_stm32::rcc;
-use embassy_stm32::rng::{self, Rng};
 use embassy_stm32::{Config, bind_interrupts};
 use embassy_stm32_wpan::controller::ControllerAdapter;
 // The WBA stack type, aliased: `Controller` is the trouble-host trait this file
@@ -52,9 +48,6 @@ use trouble_host::iso::{IsoEvents, IsoSdu};
 use trouble_host::prelude::*;
 
 bind_interrupts!(struct Irqs {
-    RNG => rng::InterruptHandler<RNG>;
-    AES => aes::InterruptHandler<AES>;
-    PKA => pka::InterruptHandler<PKA>;
     RADIO => HighInterruptHandler;
     HASH => LowInterruptHandler;
 });
@@ -261,39 +254,6 @@ impl AseSession {
     }
 }
 
-// Force-link the software AES/ECDH drivers required by `trouble-host/security`.
-use embassy_crypto_rustcrypto as _;
-
-mod csprng {
-    use core::cell::RefCell;
-
-    use embassy_sync::blocking_mutex::Mutex;
-    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-    use rand_chacha::ChaCha12Rng;
-    use rand_chacha::rand_core::{RngCore as _, SeedableRng as _};
-
-    static RNG: Mutex<CriticalSectionRawMutex, RefCell<Option<ChaCha12Rng>>> = Mutex::new(RefCell::new(None));
-
-    /// Seed the CSPRNG from hardware entropy before initializing the BLE host.
-    pub fn seed(seed: [u8; 32]) {
-        RNG.lock(|rng| rng.replace(Some(ChaCha12Rng::from_seed(seed))));
-    }
-
-    struct Driver;
-
-    impl embassy_crypto::driver::Rng for Driver {
-        fn fill_bytes(buf: &mut [u8]) {
-            RNG.lock(|rng| {
-                let mut rng = rng.borrow_mut();
-                let rng = rng.as_mut().expect("CSPRNG used before it was seeded");
-                rng.fill_bytes(buf);
-            })
-        }
-    }
-
-    embassy_crypto::rng_impl!(Driver);
-}
-
 #[embassy_executor::task]
 async fn ble_runner_task(platform: &'static Platform) {
     platform.run_ble().await
@@ -304,15 +264,10 @@ async fn main(spawner: Spawner) {
     let mut config = Config::default();
     config.rcc = rcc::Config::new_wpan();
 
-    let p = embassy_stm32::init(config);
+    let _p = embassy_stm32::init(config);
     info!("Embassy STM32WBA6 LE Audio unicast sink");
 
-    let mut rng = Rng::new(p.RNG, Irqs);
-    let mut seed = [0u8; 32];
-    rng.fill_bytes(&mut seed);
-    csprng::seed(seed);
-
-    let (platform, runtime) = new_platform!(rng, Pka::new(p.PKA, Irqs), Aes::new_blocking(p.AES, Irqs), 8);
+    let (platform, runtime) = new_platform!(8);
     spawner.spawn(ble_runner_task(platform).expect("Failed to spawn BLE runner"));
 
     let ble = WpanController::new(platform, runtime, Irqs)
