@@ -71,16 +71,24 @@ impl<'a> PacsConfig<'a> {
         builder.add_characteristic_small(
             uuid::characteristic::PACS_AVAILABLE_CONTEXTS,
             [CharacteristicProp::Read],
-            self.sink_available_contexts,
+            pack_contexts(self.sink_available_contexts, self.source_available_contexts),
         );
         builder.add_characteristic_small(
             uuid::characteristic::PACS_SUPPORTED_CONTEXTS,
             [CharacteristicProp::Read],
-            self.sink_supported_contexts,
+            pack_contexts(self.sink_supported_contexts, self.source_supported_contexts),
         );
 
         builder.build();
     }
+}
+
+/// Pack BAP Sink (bits 0..15) and Source (bits 16..31) Audio Contexts bitfields
+/// into the 4-octet GATT characteristic format (BAP v1.0 / PACS §3.4–3.5).
+const fn pack_contexts(sink: u16, source: u16) -> [u8; 4] {
+    let sink_le = sink.to_le_bytes();
+    let source_le = source.to_le_bytes();
+    [sink_le[0], sink_le[1], source_le[0], source_le[1]]
 }
 
 /// A LC3 sink PAC record for 48 kHz, 10 ms, mono.
@@ -92,8 +100,8 @@ impl<'a> PacsConfig<'a> {
 pub const LC3_SINK_48K_10MS_MONO: &[u8] = &[
     // Codec_ID: LC3 is coding format 0x06, with no company or vendor id.
     0x06, 0x00, 0x00, 0x00, 0x00, // Capabilities: 19 octets, the five LTV entries below.
-    0x13, // Supported_Sampling_Frequencies: 48 kHz is bit 15.
-    0x03, 0x01, 0x00, 0x80, // Supported_Frame_Durations: bit 0 is 7.5 ms, bit 1 is 10 ms.
+    0x13, // Supported_Sampling_Frequencies: 48 kHz is bit 7 (0x0080).
+    0x03, 0x01, 0x80, 0x00, // Supported_Frame_Durations: bit 0 is 7.5 ms, bit 1 is 10 ms.
     0x02, 0x02, 0x02, // Supported_Audio_Channel_Counts: bit 0 is one channel.
     0x02, 0x03, 0x01, // Supported_Octets_Per_Codec_Frame: minimum 40, maximum 120.
     0x05, 0x04, 0x28, 0x00, 0x78, 0x00, // Supported_Max_Codec_Frames_Per_SDU.
@@ -166,5 +174,13 @@ mod tests {
         assert!(meta_at + 1 <= LC3_SINK_48K_10MS_MONO.len());
         let meta_len = LC3_SINK_48K_10MS_MONO[meta_at] as usize;
         assert_eq!(meta_at + 1 + meta_len, LC3_SINK_48K_10MS_MONO.len());
+        // Supported_Sampling_Frequencies (type 0x01): 48 kHz = bit 7 = 0x0080 LE.
+        assert_eq!(&LC3_SINK_48K_10MS_MONO[6..10], &[0x03, 0x01, 0x80, 0x00]);
+    }
+
+    #[test]
+    fn contexts_pack_as_four_le_bytes() {
+        assert_eq!(pack_contexts(0x0007, 0x0001), [0x07, 0x00, 0x01, 0x00]);
+        assert_eq!(pack_contexts(0x0201, 0x0004), [0x01, 0x02, 0x04, 0x00]);
     }
 }

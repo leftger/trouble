@@ -77,6 +77,15 @@ pub trait AudioDecoder {
     /// `pcm` must have room for [`CodecConfig::pcm_frame_len`] samples; the
     /// excess, if any, is left untouched.
     fn decode(&mut self, frame: &[u8], pcm: &mut [i16]) -> Result<(), Self::Error>;
+
+    /// Conceal one lost or corrupted codec frame into `pcm` (Packet Loss Concealment).
+    ///
+    /// `pcm` must have room for [`CodecConfig::pcm_frame_len`] samples; the
+    /// excess, if any, is left untouched. The default implementation zeroes `pcm`.
+    fn decode_lost(&mut self, pcm: &mut [i16]) -> Result<(), Self::Error> {
+        pcm.fill(0);
+        Ok(())
+    }
 }
 
 /// Encodes PCM samples into codec frames.
@@ -132,6 +141,15 @@ impl AudioDecoder for PassthroughCodec {
         for (i, out) in pcm[..n].iter_mut().enumerate() {
             *out = i16::from_le_bytes([frame[i * 2], frame[i * 2 + 1]]);
         }
+        Ok(())
+    }
+
+    fn decode_lost(&mut self, pcm: &mut [i16]) -> Result<(), Self::Error> {
+        let n = self.config.pcm_frame_len();
+        if pcm.len() < n {
+            return Err(CodecError::BufferTooSmall);
+        }
+        pcm[..n].fill(0);
         Ok(())
     }
 }
@@ -259,6 +277,12 @@ pub mod lc3 {
             self.inner
                 .decode_frame(16, 0, frame, &mut pcm[..n])
                 .map_err(|_| CodecError::DecodeFailed)
+        }
+
+        fn decode_lost(&mut self, pcm: &mut [i16]) -> Result<(), Self::Error> {
+            // `lc3-codec` 0.2 has no separate BFI parameter: an unparseable/empty input
+            // causes `read_frame` to return Err and triggers its internal PLC path.
+            self.decode(&[], pcm)
         }
     }
 
@@ -416,6 +440,31 @@ mod tests {
                 crate::codec::lc3::Lc3Encoder::new(CFG, &mut integer, &mut enc_scaler, &mut enc_complex).unwrap();
             let mut frame = [0u8; 40];
             assert_eq!(encoder.encode(&[0i16; 10], &mut frame), Err(CodecError::BufferTooSmall));
+        }
+
+        #[test]
+        fn decode_lost_invokes_plc_without_failing() {
+            let mut integer = [0i16; ENC.0];
+            let mut enc_scaler = [0 as Scaler; ENC.1];
+            let mut enc_complex = [Complex::default(); ENC.2];
+            let mut encoder =
+                crate::codec::lc3::Lc3Encoder::new(CFG, &mut integer, &mut enc_scaler, &mut enc_complex).unwrap();
+
+            let mut pcm_in = [0i16; CFG.frame_samples()];
+            for (i, s) in pcm_in.iter_mut().enumerate() {
+                *s = ((i as i16).wrapping_mul(173)).clamp(-20_000, 20_000);
+            }
+            let mut frame = [0u8; 40];
+            encoder.encode(&pcm_in, &mut frame).unwrap();
+
+            let mut dec_scaler = [0 as Scaler; DEC.0];
+            let mut dec_complex = [Complex::default(); DEC.1];
+            let mut decoder = crate::codec::lc3::Lc3Decoder::new(CFG, &mut dec_scaler, &mut dec_complex).unwrap();
+
+            let mut pcm_out = [0i16; CFG.frame_samples()];
+            decoder.decode(&frame, &mut pcm_out).unwrap();
+            assert!(decoder.decode_lost(&mut pcm_out).is_ok());
+            assert_eq!(decoder.decode_lost(&mut [0i16; 10]), Err(CodecError::BufferTooSmall));
         }
     }
 }

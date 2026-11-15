@@ -2,7 +2,8 @@
 
 use bt_hci::cmd::{AsyncCmd, SyncCmd};
 use bt_hci::controller::{Controller, ControllerCmdAsync, ControllerCmdSync};
-use bt_hci::data::IsoPacket;
+use bt_hci::data::IsoDataLoadHeader;
+pub use bt_hci::data::{IsoPacket, IsoPacketBoundary, IsoPacketStatus};
 use bt_hci::event::le::{LeCisEstablished, LeCisRequest};
 use bt_hci::param::ConnHandle;
 use embassy_sync::blocking_mutex::raw::RawMutex;
@@ -90,10 +91,33 @@ pub struct IsoEvents<M: RawMutex, const REQ: usize, const EST: usize, const DATA
 pub struct IsoSdu<const N: usize> {
     /// The CIS the audio arrived on.
     pub handle: ConnHandle,
+    /// Packet Boundary flag from the HCI ISO data packet header.
+    pub boundary_flag: IsoPacketBoundary,
+    /// Optional controller-provided SDU timestamp, in microseconds.
+    pub timestamp: Option<u32>,
+    /// Controller SDU sequence number (`0` when no `ISO_Data_Load` header is present).
+    pub sequence_num: u16,
+    /// Controller `Packet_Status_Flag` from the `ISO_Data_Load` header.
+    pub status: IsoPacketStatus,
     /// How many octets of `data` are valid.
     pub len: usize,
     /// The payload.
     pub data: [u8; N],
+}
+
+impl<const N: usize> IsoSdu<N> {
+    /// Whether this packet carries a complete SDU marked valid by the controller.
+    pub const fn is_valid(&self) -> bool {
+        matches!(self.boundary_flag, IsoPacketBoundary::Complete) && matches!(self.status, IsoPacketStatus::Correct)
+    }
+}
+
+const fn packet_status(hdr: &IsoDataLoadHeader) -> IsoPacketStatus {
+    match (hdr.iso_sdu_len >> 14) & 0x03 {
+        0 => IsoPacketStatus::Correct,
+        1 => IsoPacketStatus::PossiblyInvalid,
+        _ => IsoPacketStatus::PartiallyLost,
+    }
 }
 
 impl<const N: usize> IsoSdu<N> {
@@ -136,7 +160,13 @@ impl<M: RawMutex, const REQ: usize, const EST: usize, const DATA: usize, const S
     /// Drops it if it is too large to represent, rather than delivering a
     /// truncated SDU as though it were a whole one, and drops it if the queue
     /// is full.
-    fn push_received(&self, handle: ConnHandle, payload: &[u8]) {
+    fn push_sdu(
+        &self,
+        handle: ConnHandle,
+        boundary_flag: IsoPacketBoundary,
+        header: Option<IsoDataLoadHeader>,
+        payload: &[u8],
+    ) {
         if payload.len() > SDU {
             return;
         }
@@ -144,11 +174,25 @@ impl<M: RawMutex, const REQ: usize, const EST: usize, const DATA: usize, const S
         let mut data = [0u8; SDU];
         data[..payload.len()].copy_from_slice(payload);
 
+        let (timestamp, sequence_num, status) = match header {
+            Some(hdr) => (hdr.timestamp, hdr.sequence_num, packet_status(&hdr)),
+            None => (None, 0, IsoPacketStatus::Correct),
+        };
+
         let _ = self.received.try_send(IsoSdu {
             handle,
+            boundary_flag,
+            timestamp,
+            sequence_num,
+            status,
             len: payload.len(),
             data,
         });
+    }
+
+    #[cfg(test)]
+    fn push_received(&self, handle: ConnHandle, payload: &[u8]) {
+        self.push_sdu(handle, IsoPacketBoundary::Complete, None, payload);
     }
 }
 
@@ -172,7 +216,12 @@ impl<M: RawMutex, const REQ: usize, const EST: usize, const DATA: usize, const S
     }
 
     fn on_iso_data(&self, packet: &IsoPacket<'_>) {
-        self.push_received(packet.handle(), packet.data());
+        self.push_sdu(
+            packet.handle(),
+            packet.boundary_flag(),
+            packet.data_load_header(),
+            packet.data(),
+        );
     }
 }
 
@@ -253,5 +302,50 @@ mod tests {
 
         assert!(events.received.try_receive().is_ok());
         assert!(events.received.try_receive().is_err());
+    }
+
+    #[test]
+    fn on_iso_data_preserves_header_metadata_and_packet_status() {
+        let events: IsoEvents<NoopRawMutex, 2, 2, 4, 8> = IsoEvents::new();
+
+        // Handle 0x0040 | PB=Complete (2 << 12) | TS=1 (1 << 14) = 0x6040
+        // Data_Load_Length = 4(ts) + 2(seq) + 2(len) + 3(payload) = 11
+        let valid_raw = [
+            0x40, 0x60, 11, 0x00, // IsoPacketHeader
+            0x78, 0x56, 0x34, 0x12, // timestamp = 0x1234_5678
+            0x07, 0x00, // sequence_num = 7
+            0x03, 0x00, // iso_sdu_len = 3, Packet_Status_Flag = 0 (Correct)
+            0xaa, 0xbb, 0xcc,
+        ];
+        let (pkt, rest) = IsoPacket::from_hci_bytes(&valid_raw).unwrap();
+        assert!(rest.is_empty());
+        events.on_iso_data(&pkt);
+
+        let sdu = events.received.try_receive().unwrap();
+        assert_eq!(sdu.handle, ConnHandle::new(0x0040));
+        assert_eq!(sdu.boundary_flag, IsoPacketBoundary::Complete);
+        assert_eq!(sdu.timestamp, Some(0x1234_5678));
+        assert_eq!(sdu.sequence_num, 7);
+        assert_eq!(sdu.status, IsoPacketStatus::Correct);
+        assert!(sdu.is_valid());
+        assert_eq!(sdu.as_slice(), &[0xaa, 0xbb, 0xcc]);
+
+        // Same handle without timestamp, PB=Complete (0x2040), status=PartiallyLost (2 << 14 = 0x8000)
+        let lost_raw = [
+            0x40, 0x20, 4, 0x00, // IsoPacketHeader (no timestamp, len=4)
+            0x08, 0x00, // sequence_num = 8
+            0x00, 0x80, // iso_sdu_len = 0, Packet_Status_Flag = 2 (PartiallyLost)
+        ];
+        let (lost_pkt, rest) = IsoPacket::from_hci_bytes(&lost_raw).unwrap();
+        assert!(rest.is_empty());
+        events.on_iso_data(&lost_pkt);
+
+        let lost = events.received.try_receive().unwrap();
+        assert_eq!(lost.boundary_flag, IsoPacketBoundary::Complete);
+        assert_eq!(lost.timestamp, None);
+        assert_eq!(lost.sequence_num, 8);
+        assert_eq!(lost.status, IsoPacketStatus::PartiallyLost);
+        assert!(!lost.is_valid());
+        assert!(lost.as_slice().is_empty());
     }
 }

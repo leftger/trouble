@@ -28,6 +28,13 @@ embedded-hal = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 heapless = { version = "0.9", default-features = false }
 static_cell = "2"
+embassy-crypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", optional = true }
+embassy-crypto-rustcrypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", optional = true, features = [
+    "embassy-crypto-aes128-ecb",
+    "embassy-crypto-aes128-cmac",
+    "embassy-crypto-p256-ecdh",
+] }
+rand_chacha = { version = "0.3", default-features = false, optional = true }
 
 [features]
 default = ["stm32wba65ri"]
@@ -38,8 +45,8 @@ stm32wba65ri = [ "stm32wba65ri-core", "embassy-stm32-wpan/linklayer6-ble-basic" 
 # ISO / LE Audio: Full link layer (required for CIS/BIS) plus trouble-host ISO support.
 # Build with --no-default-features: the Basic and Full link layer images cannot be linked together.
 stm32wba65ri-iso = [ "stm32wba65ri-core", "embassy-stm32-wpan/linklayer6-ble-full", "trouble-host/iso" ]
-# LE Audio unicast sink: ISO plus the PACS and ASCS GATT services.
-stm32wba65ri-audio = [ "stm32wba65ri-iso", "trouble-host/le-audio" ]
+# LE Audio unicast sink: ISO plus PACS/ASCS, JustWorks security + bonding, and LC3 decoding.
+stm32wba65ri-audio = [ "stm32wba65ri-iso", "trouble-host/le-audio", "trouble-host/security", "trouble-audio/codec-lc3", "dep:embassy-crypto", "dep:embassy-crypto-rustcrypto", "dep:rand_chacha" ]
 
 [[bin]]
 name = "ble_bas_peripheral"
